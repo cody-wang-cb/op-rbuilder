@@ -14,20 +14,12 @@ use crate::{
 
 #[tokio::test]
 async fn chain_produces_blocks() -> eyre::Result<()> {
-    let rbuilder = LocalInstance::new::<FlashblocksBuilder>(OpRbuilderArgs {
-        chain_block_time: 2000,
-        flashblocks: FlashblocksArgs {
-            enabled: true,
-            flashblocks_port: 1239,
-            flashblocks_addr: "127.0.0.1".into(),
-            flashblocks_block_time: 200,
-        },
-        ..Default::default()
-    })
-    .await?;
-
-    let driver = rbuilder.driver().await?;
-    driver.fund_default_accounts().await?;
+    let harness = TestHarnessBuilder::new("flashbots_chain_produces_blocks")
+        .with_flashblocks_port(1239)
+        .with_chain_block_time(2000)
+        .with_flashblocks_per_block(10)
+        .build()
+        .await?;
 
     // Create a struct to hold received messages
     let received_messages = Arc::new(Mutex::new(Vec::new()));
