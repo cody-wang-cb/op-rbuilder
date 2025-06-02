@@ -5,7 +5,6 @@ use super::{config::FlashblocksConfig, wspub::WebSocketPublisher};
 use crate::{
     builders::{
         context::{estimate_gas_for_builder_tx, OpPayloadBuilderCtx},
-        flashblocks::config::FlashBlocksConfigExt,
         generator::{BlockCell, BuildArguments},
         BuilderConfig,
     },
@@ -252,12 +251,12 @@ where
             // return early since we don't need to build a block with transactions from the pool
             return Ok(());
         }
-        let gas_per_batch = ctx.block_gas_limit() / self.config.flashblocks_per_block();
+        let gas_per_batch = ctx.block_gas_limit() / self.config.specific.flashblocks_per_block;
         let mut total_gas_per_batch = gas_per_batch;
         let da_per_batch = ctx
             .da_config
             .max_da_block_size()
-            .map(|da_limit| da_limit / self.config.flashblocks_per_block());
+            .map(|da_limit| da_limit / self.config.specific.flashblocks_per_block);
         // Check that builder tx won't affect fb limit too much
         if let Some(da_limit) = da_per_batch {
             // We error if we can't insert any tx aside from builder tx in flashblock
@@ -267,14 +266,14 @@ where
         }
         let mut total_da_per_batch = da_per_batch;
 
-        let last_flashblock = self.config.flashblocks_per_block().saturating_sub(1);
+        let last_flashblock = self.config.specific.flashblocks_per_block.saturating_sub(1);
         let mut flashblock_count = 0;
         // Create a channel to coordinate flashblock building
         let (build_tx, mut build_rx) = mpsc::channel(1);
 
         // Spawn the timer task that signals when to build a new flashblock
         let cancel_clone = ctx.cancel.clone();
-        let interval = self.config.specific.interval;
+        let interval = self.config.specific.build_interval;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
             loop {
@@ -288,12 +287,16 @@ where
                         }
                     }
                 _ = interval.tick() => {
-                            if let Err(err) = build_tx.send(()).await {
-                                error!(target: "payload_builder", "Error sending build signal: {}", err);
-                                break;
-                            }
+                    if let Err(err) = build_tx.send(()).await {
+                        if build_tx.is_closed() || cancel_clone.is_cancelled() {
+                            debug!(target: "payload_builder", "Building is stopped");
+                            break;
                         }
-                }
+
+                        error!(target: "payload_builder", "Error sending build signal: {}", err);
+                        break;
+                    }
+                }}
             }
         });
 
@@ -325,6 +328,19 @@ where
                         return None;
                     }
 
+                    // If we've built all the flashblocks, no more work to do
+                    if flashblock_count >= self.config.specific.flashblocks_per_block {
+                        tracing::info!(
+                            target: "payload_builder",
+                            target = self.config.specific.flashblocks_per_block,
+                            flashblock_count = flashblock_count,
+                            block_number = ctx.block_number(),
+                            "Built all flashblocks, stopping payload builder",
+                        );
+
+                        return None;
+                    }
+
                     // Wait for next message
                     build_rx.recv().await
                 })
@@ -333,17 +349,6 @@ where
             // Exit loop if channel closed or cancelled
             match received {
                 Some(()) => {
-                    if flashblock_count >= self.config.flashblocks_per_block() {
-                        tracing::info!(
-                            target: "payload_builder",
-                            target = self.config.flashblocks_per_block(),
-                            flashblock_count = flashblock_count,
-                            block_number = ctx.block_number(),
-                            "Skipping flashblock reached target",
-                        );
-                        continue;
-                    }
-
                     // Continue with flashblock building
                     tracing::info!(
                         target: "payload_builder",
@@ -355,6 +360,7 @@ where
                         da_used = info.cumulative_da_bytes_used,
                         "Building flashblock",
                     );
+
                     let flashblock_build_start_time = Instant::now();
                     let state = StateProviderDatabase::new(&state_provider);
                     invoke_on_first_flashblock(flashblock_count, || {
@@ -401,7 +407,7 @@ where
                     if ctx.cancel.is_cancelled() {
                         tracing::info!(
                             target: "payload_builder",
-                            "Job cancelled, stopping payload building",
+                            "Job cancelled, stopping payload building block_number={}", ctx.block_number()
                         );
                         // if the job was cancelled, stop
                         return Ok(());
@@ -476,7 +482,6 @@ where
                     }
                 }
                 None => {
-                    // Exit loop if channel closed or cancelled
                     self.metrics.block_built_success.increment(1);
                     self.metrics
                         .flashblock_count
@@ -486,6 +491,7 @@ where
                         message = "Payload building complete, channel closed or job cancelled"
                     );
                     span.record("flashblock_count", flashblock_count);
+                    tracing::info!(target: "payload_builder", "Completed block building block={} flashblock_count={}", ctx.block_number(), flashblock_count);
                     return Ok(());
                 }
             }
