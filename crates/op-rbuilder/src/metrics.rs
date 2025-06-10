@@ -50,6 +50,8 @@ pub struct OpRBuilderMetrics {
     pub transaction_pool_fetch_duration: Histogram,
     /// Duration of state root calculation
     pub state_root_calculation_duration: Histogram,
+    /// Duration of state root calculation task
+    pub state_root_calculation_task_duration: Histogram,
     /// Duration of sequencer transaction execution
     pub sequencer_tx_duration: Histogram,
     /// Duration of state merge transitions

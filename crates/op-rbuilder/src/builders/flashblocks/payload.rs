@@ -37,13 +37,285 @@ use reth_revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
     State,
 };
+use reth_trie::HashedPostState;
 use revm::Database;
 use rollup_boost::{
     ExecutionPayloadBaseV1, ExecutionPayloadFlashblockDeltaV1, FlashblocksPayloadV1,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+
+// Async state root system data structures
+#[derive(Debug)]
+struct StateRootJob {
+    block_number: u64,
+    flashblock_index: u64,
+    hashed_state: HashedPostState,
+    unsealed_header: Header,
+    block_body: BlockBody<OpTransactionSigned>,
+    payload_id: reth::payload::PayloadId,
+    total_fees: U256,
+}
+
+#[derive(Debug)]
+struct CompletedPayloads {
+    payloads: Vec<OpBuiltPayload>,
+    max_flashblock_index: u64,
+    current_block_number: u64,
+}
+
+impl CompletedPayloads {
+    fn new() -> Self {
+        Self {
+            payloads: Vec::new(),
+            max_flashblock_index: 0,
+            current_block_number: 0,
+        }
+    }
+
+    fn try_insert(
+        &mut self,
+        payload: OpBuiltPayload,
+        flashblock_index: u64,
+        block_number: u64,
+    ) -> bool {
+        info!(target: "payload_builder", "Trying to insert payload with flashblock index: {}", flashblock_index);
+        info!(target: "payload_builder", "Max flashblock index: {}", self.max_flashblock_index);
+
+        // Reset if new block detected
+        if block_number != self.current_block_number {
+            info!(target: "payload_builder",
+                "New block detected: {} -> {}, resetting max_flashblock_index and clearing old payloads",
+                self.current_block_number, block_number
+            );
+            self.max_flashblock_index = 0;
+            self.current_block_number = block_number;
+            self.payloads.clear(); // Clear old payloads from previous block
+        }
+
+        if flashblock_index > self.max_flashblock_index {
+            self.payloads.push(payload);
+            self.max_flashblock_index = flashblock_index;
+            true // Inserted
+        } else {
+            false // Rejected as outdated
+        }
+    }
+
+    fn pop_latest(&mut self) -> Option<OpBuiltPayload> {
+        self.payloads.pop()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.payloads.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct AsyncStateRootManager {
+    job_tx: mpsc::UnboundedSender<StateRootJob>,
+    completed_payloads: Arc<tokio::sync::Mutex<CompletedPayloads>>,
+}
+
+impl AsyncStateRootManager {
+    fn new<Client>(client: Client, metrics: Arc<OpRBuilderMetrics>) -> Self
+    where
+        Client: ClientBounds + 'static,
+    {
+        let (job_tx, job_rx) = mpsc::unbounded_channel();
+        let completed_payloads = Arc::new(tokio::sync::Mutex::new(CompletedPayloads::new()));
+
+        // Create shared job receiver for multiple workers
+        let job_rx_shared = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+        // Spawn 4 worker tasks
+        const NUM_WORKERS: usize = 4;
+        for worker_id in 0..NUM_WORKERS {
+            let client_clone = client.clone();
+            let job_rx_clone = Arc::clone(&job_rx_shared);
+            let completed_payloads_clone = Arc::clone(&completed_payloads);
+            let metrics_clone = Arc::clone(&metrics);
+
+            tokio::spawn(async move {
+                Self::worker_task(
+                    worker_id,
+                    client_clone,
+                    job_rx_clone,
+                    completed_payloads_clone,
+                    metrics_clone,
+                )
+                .await;
+            });
+        }
+
+        Self {
+            job_tx,
+            completed_payloads,
+        }
+    }
+
+    async fn worker_task<Client>(
+        worker_id: usize,
+        client: Client,
+        job_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<StateRootJob>>>,
+        completed_payloads: Arc<tokio::sync::Mutex<CompletedPayloads>>,
+        metrics: Arc<OpRBuilderMetrics>,
+    ) where
+        Client: ClientBounds + 'static,
+    {
+        info!(target: "payload_builder", worker_id = worker_id, "State root worker started");
+
+        loop {
+            // Get next job (workers compete for jobs)
+            let job = {
+                let mut rx = job_rx.lock().await;
+                rx.recv().await
+            };
+
+            match job {
+                Some(job) => {
+                    info!(target: "payload_builder",
+                        worker_id = worker_id,
+                        block_number = job.block_number,
+                        flashblock_index = job.flashblock_index,
+                        "Worker processing state root job"
+                    );
+
+                    // Process the state root calculation
+                    let result = Self::calculate_state_root(&client, &job, &metrics).await;
+
+                    // If calculation succeeded, create final payload with correct state root
+                    if let Ok(state_root) = result {
+                        // Update header with real state root
+                        let mut final_header = job.unsealed_header;
+                        final_header.state_root = state_root;
+
+                        // Seal the block
+                        let sealed_block = Arc::new(
+                            alloy_consensus::Block::<OpTransactionSigned>::new(
+                                final_header,
+                                job.block_body,
+                            )
+                            .seal_slow(),
+                        );
+
+                        // Create final payload
+                        let final_payload =
+                            OpBuiltPayload::new(job.payload_id, sealed_block, job.total_fees, None);
+
+                        // Try to insert payload (only if not outdated)
+                        let inserted = {
+                            let mut payloads = completed_payloads.lock().await;
+                            payloads.try_insert(
+                                final_payload,
+                                job.flashblock_index,
+                                job.block_number,
+                            )
+                        };
+
+                        if inserted {
+                            info!(target: "payload_builder",
+                                worker_id = worker_id,
+                                block_number = job.block_number,
+                                flashblock_index = job.flashblock_index,
+                                state_root = %state_root,
+                                "Worker completed and inserted payload"
+                            );
+                        } else {
+                            info!(target: "payload_builder",
+                                worker_id = worker_id,
+                                block_number = job.block_number,
+                                flashblock_index = job.flashblock_index,
+                                "Worker completed but payload was outdated, discarded"
+                            );
+                        }
+                    } else {
+                        warn!(target: "payload_builder",
+                            worker_id = worker_id,
+                            block_number = job.block_number,
+                            flashblock_index = job.flashblock_index,
+                            "Worker failed to calculate state root"
+                        );
+                    }
+                }
+                None => {
+                    info!(target: "payload_builder", worker_id = worker_id, "Worker shutting down - channel closed");
+                    break; // Channel closed
+                }
+            }
+        }
+    }
+
+    async fn calculate_state_root<Client>(
+        client: &Client,
+        job: &StateRootJob,
+        metrics: &OpRBuilderMetrics,
+    ) -> Result<B256, PayloadBuilderError>
+    where
+        Client: ClientBounds,
+    {
+        let state_root_start_time = Instant::now();
+        let state_provider = client.state_by_block_hash(job.unsealed_header.parent_hash)?;
+
+        // Calculate state root with the hashed state
+        let (state_root, _trie_output) = state_provider
+            .state_root_with_updates(job.hashed_state.clone())
+            .map_err(PayloadBuilderError::other)?;
+
+        metrics
+            .state_root_calculation_task_duration
+            .record(state_root_start_time.elapsed());
+
+        Ok(state_root)
+    }
+
+    fn submit_job_async(
+        &self,
+        block_number: u64,
+        flashblock_index: u64,
+        hashed_state: HashedPostState,
+        unsealed_header: Header,
+        block_body: BlockBody<OpTransactionSigned>,
+        payload_id: reth::payload::PayloadId,
+        total_fees: U256,
+    ) -> bool {
+        let job = StateRootJob {
+            block_number,
+            flashblock_index,
+            hashed_state,
+            unsealed_header,
+            block_body,
+            payload_id,
+            total_fees,
+        };
+
+        // Submit job and return whether it was successful (fire-and-forget)
+        self.job_tx.send(job).is_ok()
+    }
+
+    async fn get_latest_completed_payload(&self) -> Option<OpBuiltPayload> {
+        let mut payloads = self.completed_payloads.lock().await;
+        if payloads.is_empty() {
+            debug!(target: "payload_builder", "No completed payloads available");
+            return None;
+        }
+
+        // Take the most recent payload (last in the vector)
+        let latest_payload = payloads.pop_latest();
+
+        if let Some(ref payload) = latest_payload {
+            info!(target: "payload_builder",
+                payload_id = ?payload.id(),
+                block_hash = ?payload.block().hash(),
+                max_flashblock_index = payloads.max_flashblock_index,
+                "Retrieved latest completed payload"
+            );
+        }
+
+        latest_payload
+    }
+}
 
 #[derive(Debug, Default)]
 struct ExtraExecutionInfo {
@@ -67,9 +339,14 @@ pub struct OpPayloadBuilder<Pool, Client> {
     pub config: BuilderConfig<FlashblocksConfig>,
     /// The metrics for the builder
     pub metrics: Arc<OpRBuilderMetrics>,
+    /// Async state root manager
+    pub state_root_manager: Arc<AsyncStateRootManager>,
 }
 
-impl<Pool, Client> OpPayloadBuilder<Pool, Client> {
+impl<Pool, Client> OpPayloadBuilder<Pool, Client>
+where
+    Client: Clone + ClientBounds + 'static,
+{
     /// `OpPayloadBuilder` constructor.
     pub fn new(
         evm_config: OpEvmConfig,
@@ -79,6 +356,10 @@ impl<Pool, Client> OpPayloadBuilder<Pool, Client> {
     ) -> eyre::Result<Self> {
         let metrics = Arc::new(OpRBuilderMetrics::default());
         let ws_pub = WebSocketPublisher::new(config.specific.ws_addr, Arc::clone(&metrics))?.into();
+        let state_root_manager = Arc::new(AsyncStateRootManager::new(
+            client.clone(),
+            Arc::clone(&metrics),
+        ));
 
         Ok(Self {
             evm_config,
@@ -87,6 +368,7 @@ impl<Pool, Client> OpPayloadBuilder<Pool, Client> {
             ws_pub,
             config,
             metrics,
+            state_root_manager,
         })
     }
 }
@@ -120,7 +402,7 @@ where
 impl<Pool, Client> OpPayloadBuilder<Pool, Client>
 where
     Pool: PoolBounds,
-    Client: ClientBounds,
+    Client: ClientBounds + 'static,
 {
     /// Constructs an Optimism payload from the transactions sent via the
     /// Payload attributes by the sequencer. If the `no_tx_pool` argument is passed in
@@ -204,7 +486,8 @@ where
             .sequencer_tx_duration
             .record(sequencer_tx_start_time.elapsed());
 
-        let (payload, fb_payload, mut bundle_state) = build_block(db, &ctx, &mut info)?;
+        // Use sync mode for the initial block (flashblock 0)
+        let (payload, fb_payload, mut bundle_state) = build_block_sync(db, &ctx, &mut info, 0)?;
 
         best_payload.set(payload.clone());
         self.ws_pub
@@ -385,7 +668,30 @@ where
                     });
 
                     let total_block_built_duration = Instant::now();
-                    let build_result = build_block(db, &ctx, &mut info);
+                    // Use async mode for flashblocks
+                    let build_result = match build_block_async(
+                        db,
+                        &ctx,
+                        &mut info,
+                        &*self.state_root_manager,
+                        flashblock_count + 1,
+                    ) {
+                        Ok((fb_payload, bundle_state, job_submitted)) => {
+                            if !job_submitted {
+                                warn!(target: "payload_builder", "Failed to submit state root job for flashblock");
+                            }
+
+                            // Try to get latest completed payload from worker
+                            let completed_payload = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async {
+                                    self.state_root_manager.get_latest_completed_payload().await
+                                })
+                            });
+
+                            Ok((completed_payload, fb_payload, bundle_state))
+                        }
+                        Err(e) => Err(e),
+                    };
                     ctx.metrics
                         .total_block_built_duration
                         .record(total_block_built_duration.elapsed());
@@ -399,7 +705,7 @@ where
                             // Return the error
                             return Err(err);
                         }
-                        Ok((new_payload, mut fb_payload, new_bundle_state)) => {
+                        Ok((completed_payload_opt, mut fb_payload, new_bundle_state)) => {
                             fb_payload.index = flashblock_count + 1; // we do this because the fallback block is index 0
                             fb_payload.base = None;
 
@@ -411,14 +717,28 @@ where
                             self.metrics
                                 .flashblock_build_duration
                                 .record(flashblock_build_start_time.elapsed());
-                            ctx.metrics
-                                .payload_byte_size
-                                .record(new_payload.block().size() as f64);
+
                             ctx.metrics
                                 .payload_num_tx
                                 .record(info.executed_transactions.len() as f64);
 
-                            best_payload.set(new_payload.clone());
+                            // Only update payload and related metrics if we have a completed payload
+                            if let Some(new_payload) = completed_payload_opt {
+                                ctx.metrics
+                                    .payload_byte_size
+                                    .record(new_payload.block().size() as f64);
+                                best_payload.set(new_payload.clone());
+                                info!(target: "payload_builder",
+                                    flashblock_count = flashblock_count,
+                                    "Updated best_payload with completed payload from worker"
+                                );
+                            } else {
+                                info!(target: "payload_builder",
+                                    flashblock_count = flashblock_count,
+                                    "No completed payload ready, keeping previous best_payload"
+                                );
+                            }
+
                             // Update bundle_state for next iteration
                             bundle_state = new_bundle_state;
                             total_gas_per_batch += gas_per_batch;
@@ -450,7 +770,7 @@ where
 impl<Pool, Client> crate::builders::generator::PayloadBuilder for OpPayloadBuilder<Pool, Client>
 where
     Pool: PoolBounds,
-    Client: ClientBounds,
+    Client: ClientBounds + 'static,
 {
     type Attributes = OpPayloadBuilderAttributes<OpTransactionSigned>;
     type BuiltPayload = OpBuiltPayload;
@@ -490,10 +810,11 @@ where
     Ok(info)
 }
 
-fn build_block<DB, P>(
+fn build_block_sync<DB, P>(
     mut state: State<DB>,
     ctx: &OpPayloadBuilderCtx,
     info: &mut ExecutionInfo<ExtraExecutionInfo>,
+    flashblock_index: u64,
 ) -> Result<(OpBuiltPayload, FlashblocksPayloadV1, BundleState), PayloadBuilderError>
 where
     DB: Database<Error = ProviderError> + AsRef<P>,
@@ -533,26 +854,33 @@ where
         .block_logs_bloom(block_number)
         .expect("Number is in range");
 
-    // // calculate the state root
+    // Calculate state root synchronously
     let state_root_start_time = Instant::now();
     let state_provider = state.database.as_ref();
     let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
-    let (state_root, _trie_output) = {
-        state
-            .database
-            .as_ref()
-            .state_root_with_updates(hashed_state.clone())
-            .inspect_err(|err| {
-                warn!(target: "payload_builder",
-                parent_header=%ctx.parent().hash(),
-                    %err,
-                    "failed to calculate state root for payload"
-                );
-            })?
-    };
+
+    let (state_root, _trie_output) = state
+        .database
+        .as_ref()
+        .state_root_with_updates(hashed_state.clone())
+        .inspect_err(|err| {
+            warn!(target: "payload_builder",
+            parent_header=%ctx.parent().hash(),
+                %err,
+                "failed to calculate state root for payload"
+            );
+        })?;
+
     ctx.metrics
         .state_root_calculation_duration
         .record(state_root_start_time.elapsed());
+
+    info!(target: "payload_builder",
+        block_number = block_number,
+        flashblock_index = flashblock_index,
+        state_root = %state_root,
+        "Used synchronous state root calculation"
+    );
 
     let mut requests_hash = None;
     let withdrawals_root = if ctx
@@ -621,7 +949,12 @@ where
     );
 
     let sealed_block = Arc::new(block.seal_slow());
-    debug!(target: "payload_builder", ?sealed_block, "sealed built block");
+    info!(target: "payload_builder",
+        block_number = block_number,
+        flashblock_index = flashblock_index,
+        ?sealed_block,
+        "sealed built block"
+    );
 
     let block_hash = sealed_block.hash();
 
@@ -685,20 +1018,225 @@ where
         metadata: serde_json::to_value(&metadata).unwrap_or_default(),
     };
 
-    Ok((
-        OpBuiltPayload::new(
-            ctx.payload_id(),
-            sealed_block,
-            info.total_fees,
-            // This must be set to NONE for now because we are doing merge transitions on every flashblock
-            // when it should only happen once per block, thus, it returns a confusing state back to op-reth.
-            // We can live without this for now because Op syncs up the executed block using new_payload
-            // calls, but eventually we would want to return the executed block here.
-            None,
-        ),
-        fb_payload,
-        new_bundle,
-    ))
+    let payload = OpBuiltPayload::new(
+        ctx.payload_id(),
+        sealed_block,
+        info.total_fees,
+        // This must be set to NONE for now because we are doing merge transitions on every flashblock
+        // when it should only happen once per block, thus, it returns a confusing state back to op-reth.
+        // We can live without this for now because Op syncs up the executed block using new_payload
+        // calls, but eventually we would want to return the executed block here.
+        None,
+    );
+
+    Ok((payload, fb_payload, new_bundle))
+}
+
+fn build_block_async<DB, P>(
+    mut state: State<DB>,
+    ctx: &OpPayloadBuilderCtx,
+    info: &mut ExecutionInfo<ExtraExecutionInfo>,
+    state_root_manager: &AsyncStateRootManager,
+    flashblock_index: u64,
+) -> Result<(FlashblocksPayloadV1, BundleState, bool), PayloadBuilderError>
+where
+    DB: Database<Error = ProviderError> + AsRef<P>,
+    P: StateRootProvider + HashedPostStateProvider + StorageRootProvider,
+{
+    // TODO: We must run this only once per block, but we are running it on every flashblock
+    // merge all transitions into bundle state, this would apply the withdrawal balance changes
+    // and 4788 contract call
+    let state_merge_start_time = Instant::now();
+    state.merge_transitions(BundleRetention::Reverts);
+    ctx.metrics
+        .state_transition_merge_duration
+        .record(state_merge_start_time.elapsed());
+
+    let new_bundle = state.take_bundle();
+
+    let block_number = ctx.block_number();
+    assert_eq!(block_number, ctx.parent().number + 1);
+
+    let execution_outcome = ExecutionOutcome::new(
+        new_bundle.clone(),
+        vec![info.receipts.clone()],
+        block_number,
+        vec![],
+    );
+
+    let receipts_root = execution_outcome
+        .generic_receipts_root_slow(block_number, |receipts| {
+            calculate_receipt_root_no_memo_optimism(
+                receipts,
+                &ctx.chain_spec,
+                ctx.attributes().timestamp(),
+            )
+        })
+        .expect("Number is in range");
+    let logs_bloom = execution_outcome
+        .block_logs_bloom(block_number)
+        .expect("Number is in range");
+
+    // Use placeholder state root - will be calculated async
+    let placeholder_state_root = ctx.parent().state_root;
+
+    info!(target: "payload_builder",
+        block_number = block_number,
+        flashblock_index = flashblock_index,
+        "Using placeholder state root for async calculation"
+    );
+
+    let mut requests_hash = None;
+    let withdrawals_root = if ctx
+        .chain_spec
+        .is_isthmus_active_at_timestamp(ctx.attributes().timestamp())
+    {
+        // always empty requests hash post isthmus
+        requests_hash = Some(EMPTY_REQUESTS_HASH);
+
+        // withdrawals root field in block header is used for storage root of L2 predeploy
+        // `l2tol1-message-passer`
+        Some(
+            isthmus::withdrawals_root(execution_outcome.state(), state.database.as_ref())
+                .map_err(PayloadBuilderError::other)?,
+        )
+    } else if ctx
+        .chain_spec
+        .is_canyon_active_at_timestamp(ctx.attributes().timestamp())
+    {
+        Some(EMPTY_WITHDRAWALS)
+    } else {
+        None
+    };
+
+    // create the block header with placeholder state root
+    let transactions_root = proofs::calculate_transaction_root(&info.executed_transactions);
+
+    // OP doesn't support blobs/EIP-4844.
+    // https://specs.optimism.io/protocol/exec-engine.html#ecotone-disable-blob-transactions
+    // Need [Some] or [None] based on hardfork to match block hash.
+    let (excess_blob_gas, blob_gas_used) = ctx.blob_fields();
+    let extra_data = ctx.extra_data()?;
+
+    let header = Header {
+        parent_hash: ctx.parent().hash(),
+        ommers_hash: EMPTY_OMMER_ROOT_HASH,
+        beneficiary: ctx.evm_env.block_env.beneficiary,
+        state_root: placeholder_state_root,
+        transactions_root,
+        receipts_root,
+        withdrawals_root,
+        logs_bloom,
+        timestamp: ctx.attributes().payload_attributes.timestamp,
+        mix_hash: ctx.attributes().payload_attributes.prev_randao,
+        nonce: BEACON_NONCE.into(),
+        base_fee_per_gas: Some(ctx.base_fee()),
+        number: ctx.parent().number + 1,
+        gas_limit: ctx.block_gas_limit(),
+        difficulty: U256::ZERO,
+        gas_used: info.cumulative_gas_used,
+        extra_data,
+        parent_beacon_block_root: ctx.attributes().payload_attributes.parent_beacon_block_root,
+        blob_gas_used,
+        excess_blob_gas,
+        requests_hash,
+    };
+
+    // Create block body
+    let block_body = BlockBody {
+        transactions: info.executed_transactions.clone(),
+        ommers: vec![],
+        withdrawals: ctx.withdrawals().cloned(),
+    };
+
+    // pick the new transactions from the info field and update the last flashblock index
+    let new_transactions = info.executed_transactions[info.extra.last_flashblock_index..].to_vec();
+
+    let new_transactions_encoded = new_transactions
+        .clone()
+        .into_iter()
+        .map(|tx| tx.encoded_2718().into())
+        .collect::<Vec<_>>();
+
+    let new_receipts = info.receipts[info.extra.last_flashblock_index..].to_vec();
+    info.extra.last_flashblock_index = info.executed_transactions.len();
+    let receipts_with_hash = new_transactions
+        .iter()
+        .zip(new_receipts.iter())
+        .map(|(tx, receipt)| (tx.tx_hash(), receipt.clone()))
+        .collect::<HashMap<B256, OpReceipt>>();
+    let new_account_balances = new_bundle
+        .state
+        .iter()
+        .filter_map(|(address, account)| account.info.as_ref().map(|info| (*address, info.balance)))
+        .collect::<HashMap<Address, U256>>();
+
+    let metadata: FlashblocksMetadata = FlashblocksMetadata {
+        receipts: receipts_with_hash,
+        new_account_balances,
+        block_number: ctx.parent().number + 1,
+    };
+
+    // Prepare the flashblocks message with placeholder state root
+    let fb_payload = FlashblocksPayloadV1 {
+        payload_id: ctx.payload_id(),
+        index: 0,
+        base: Some(ExecutionPayloadBaseV1 {
+            parent_beacon_block_root: ctx
+                .attributes()
+                .payload_attributes
+                .parent_beacon_block_root
+                .unwrap(),
+            parent_hash: ctx.parent().hash(),
+            fee_recipient: ctx.attributes().suggested_fee_recipient(),
+            prev_randao: ctx.attributes().payload_attributes.prev_randao,
+            block_number: ctx.parent().number + 1,
+            gas_limit: ctx.block_gas_limit(),
+            timestamp: ctx.attributes().payload_attributes.timestamp,
+            extra_data: ctx.extra_data()?,
+            base_fee_per_gas: ctx.base_fee().try_into().unwrap(),
+        }),
+        diff: ExecutionPayloadFlashblockDeltaV1 {
+            state_root: placeholder_state_root,
+            receipts_root,
+            logs_bloom,
+            gas_used: info.cumulative_gas_used,
+            block_hash: B256::ZERO, // Will be calculated after state root is known
+            transactions: new_transactions_encoded,
+            withdrawals: ctx.withdrawals().cloned().unwrap_or_default().to_vec(),
+            withdrawals_root: withdrawals_root.unwrap_or_default(),
+        },
+        metadata: serde_json::to_value(&metadata).unwrap_or_default(),
+    };
+
+    // Submit async state root calculation job
+    let state_provider = state.database.as_ref();
+    let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
+
+    // Submit async state root calculation job with unsealed components
+    let job_submitted = state_root_manager.submit_job_async(
+        block_number,
+        flashblock_index,
+        hashed_state,
+        header,
+        block_body,
+        ctx.payload_id(),
+        info.total_fees,
+    );
+
+    if job_submitted {
+        debug!(target: "payload_builder",
+            block_number = block_number,
+            "Submitted async state root calculation job"
+        );
+    } else {
+        warn!(target: "payload_builder",
+            block_number = block_number,
+            "Failed to submit async state root calculation job"
+        );
+    }
+
+    Ok((fb_payload, new_bundle, job_submitted))
 }
 
 pub fn invoke_on_first_flashblock<F: FnOnce()>(current_flashblock: u64, fun: F) {
