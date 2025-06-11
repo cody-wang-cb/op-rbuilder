@@ -390,12 +390,31 @@ where
         let metrics = Arc::new(OpRBuilderMetrics::default());
         let ws_pub: Arc<WebSocketPublisher> =
             WebSocketPublisher::new(config.specific.ws_addr, Arc::clone(&metrics))?.into();
-        let state_root_manager = Arc::new(AsyncStateRootManager::new(
-            client.clone(),
-            Arc::clone(&metrics),
-            Arc::clone(&ws_pub),
-            config.specific.state_root_workers,
-        ));
+
+        // Only spawn workers if async mode is enabled
+        let state_root_manager = if config.specific.run_state_root_async {
+            info!(target: "payload_builder",
+                "Async state root calculation enabled with {} workers",
+                config.specific.state_root_workers
+            );
+            Arc::new(AsyncStateRootManager::new(
+                client.clone(),
+                Arc::clone(&metrics),
+                Arc::clone(&ws_pub),
+                config.specific.state_root_workers,
+            ))
+        } else {
+            info!(target: "payload_builder",
+                "Synchronous state root calculation enabled - no async workers spawned"
+            );
+            // Create manager with 0 workers when async is disabled
+            Arc::new(AsyncStateRootManager::new(
+                client.clone(),
+                Arc::clone(&metrics),
+                Arc::clone(&ws_pub),
+                0,
+            ))
+        };
 
         Ok(Self {
             evm_config,
@@ -711,29 +730,53 @@ where
                     });
 
                     let total_block_built_duration = Instant::now();
-                    // Use async mode for flashblocks
-                    let build_result = match build_block_async(
-                        db,
-                        &ctx,
-                        &mut info,
-                        &*self.state_root_manager,
-                        flashblock_count + 1,
-                    ) {
-                        Ok((fb_payload, bundle_state, job_submitted)) => {
-                            if !job_submitted {
-                                warn!(target: "payload_builder", "Failed to submit state root job for flashblock");
+                    let build_result = if self.config.specific.run_state_root_async {
+                        match build_block_async(
+                            db,
+                            &ctx,
+                            &mut info,
+                            &*self.state_root_manager,
+                            flashblock_count + 1,
+                        ) {
+                            Ok((fb_payload, bundle_state, job_submitted)) => {
+                                if !job_submitted {
+                                    warn!(target: "payload_builder", "Failed to submit state root job for flashblock");
+                                }
+
+                                // Try to get latest completed payload from worker
+                                let completed_payload = tokio::task::block_in_place(|| {
+                                    tokio::runtime::Handle::current().block_on(async {
+                                        self.state_root_manager.get_latest_completed_payload().await
+                                    })
+                                });
+
+                                Ok((completed_payload, fb_payload, bundle_state))
                             }
-
-                            // Try to get latest completed payload from worker
-                            let completed_payload = tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(async {
-                                    self.state_root_manager.get_latest_completed_payload().await
-                                })
-                            });
-
-                            Ok((completed_payload, fb_payload, bundle_state))
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
+                    } else {
+                        match build_block_sync(db, &ctx, &mut info, flashblock_count + 1) {
+                            Ok((completed_payload, mut fb_payload, bundle_state)) => {
+                                // Update flashblock index and base for non-first flashblocks
+                                fb_payload.index = flashblock_count + 1;
+                                fb_payload.base = None;
+
+                                // Publish immediately in sync mode
+                                self.ws_pub
+                                    .publish(&fb_payload)
+                                    .map_err(PayloadBuilderError::other)?;
+
+                                info!(target: "payload_builder",
+                                    flashblock_count = flashblock_count + 1,
+                                    state_root = %fb_payload.diff.state_root,
+                                    block_hash = %fb_payload.diff.block_hash,
+                                    "Published flashblock with synchronous state root calculation"
+                                );
+
+                                Ok((Some(completed_payload), fb_payload, bundle_state))
+                            }
+                            Err(e) => Err(e),
+                        }
                     };
                     ctx.metrics
                         .total_block_built_duration
@@ -748,7 +791,7 @@ where
                             // Return the error
                             return Err(err);
                         }
-                        Ok((completed_payload_opt, mut fb_payload, new_bundle_state)) => {
+                        Ok((completed_payload_opt, _fb_payload, new_bundle_state)) => {
                             // Record flashblock build duration
                             self.metrics
                                 .flashblock_build_duration
@@ -988,7 +1031,6 @@ where
     info!(target: "payload_builder",
         block_number = block_number,
         flashblock_index = flashblock_index,
-        ?sealed_block,
         "sealed built block"
     );
 

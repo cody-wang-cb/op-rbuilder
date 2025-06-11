@@ -116,4 +116,13 @@ pub struct FlashblocksArgs {
         env = "FLASHBLOCKS_STATE_ROOT_WORKERS"
     )]
     pub state_root_workers: usize,
+
+    /// Whether to run state root calculation asynchronously
+    /// When false, all flashblocks will use synchronous state root calculation
+    #[arg(
+        long = "flashblocks.run-state-root-async",
+        default_value = "false",
+        env = "FLASHBLOCKS_RUN_STATE_ROOT_ASYNC"
+    )]
+    pub run_state_root_async: bool,
 }

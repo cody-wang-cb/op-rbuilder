@@ -22,6 +22,9 @@ pub struct FlashblocksConfig {
 
     /// Number of worker threads for async state root calculation
     pub state_root_workers: usize,
+
+    /// Whether to run state root calculation asynchronously
+    pub run_state_root_async: bool,
 }
 
 impl Default for FlashblocksConfig {
@@ -31,6 +34,7 @@ impl Default for FlashblocksConfig {
             build_interval: Duration::from_millis(225),
             flashblocks_per_block: 10,
             state_root_workers: 4,
+            run_state_root_async: false,
         }
     }
 }
@@ -59,6 +63,7 @@ impl TryFrom<OpRbuilderArgs> for FlashblocksConfig {
             build_interval,
             flashblocks_per_block: args.flashblocks.flashblocks_per_block,
             state_root_workers: args.flashblocks.state_root_workers,
+            run_state_root_async: args.flashblocks.run_state_root_async,
         })
     }
 }
