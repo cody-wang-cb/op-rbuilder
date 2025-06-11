@@ -20,7 +20,7 @@ async fn chain_produces_blocks() -> eyre::Result<()> {
             enabled: true,
             flashblocks_port: 1239,
             flashblocks_addr: "127.0.0.1".into(),
-            flashblocks_block_time: 200,
+            flashblocks_per_block: 10,
         },
         ..Default::default()
     })
