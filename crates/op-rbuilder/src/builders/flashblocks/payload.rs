@@ -5,7 +5,6 @@ use super::{config::FlashblocksConfig, wspub::WebSocketPublisher};
 use crate::{
     builders::{
         context::{estimate_gas_for_builder_tx, OpPayloadBuilderCtx},
-        flashblocks::config::FlashBlocksConfigExt,
         generator::{BlockCell, BuildArguments},
         BuilderConfig,
     },
@@ -29,8 +28,7 @@ use reth_optimism_node::{OpBuiltPayload, OpPayloadBuilderAttributes};
 use reth_optimism_primitives::{OpPrimitives, OpReceipt, OpTransactionSigned};
 use reth_payload_util::BestPayloadTransactions;
 use reth_provider::{
-    ExecutionOutcome, HashedPostStateProvider, ProviderError, StateRootProvider,
-    StorageRootProvider,
+    ExecutionOutcome, HashedPostStateProvider, ProviderError, StateRootProvider, StorageRootProvider
 };
 use reth_revm::{
     database::StateProviderDatabase,
@@ -43,7 +41,7 @@ use rollup_boost::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, error, metadata::Level, span, warn};
+use tracing::{debug, error, metadata::Level, span, warn, info};
 
 #[derive(Debug, Default)]
 struct ExtraExecutionInfo {
@@ -135,6 +133,8 @@ where
         args: BuildArguments<OpPayloadBuilderAttributes<OpTransactionSigned>, OpBuiltPayload>,
         best_payload: BlockCell<OpBuiltPayload>,
     ) -> Result<(), PayloadBuilderError> {
+        // Cache for bundle state diff optimization
+        let mut previous_bundle_state: Option<BundleState> = None;
         let block_build_start_time = Instant::now();
         let BuildArguments { config, cancel, .. } = args;
 
@@ -216,7 +216,10 @@ where
             .sequencer_tx_duration
             .record(sequencer_tx_start_time.elapsed());
 
-        let (payload, fb_payload, mut bundle_state) = build_block(db, &ctx, &mut info)?;
+                        let (payload, fb_payload, mut bundle_state) = build_block(db, &ctx, &mut info, previous_bundle_state.as_ref())?;
+
+        // Update cache for next flashblock
+        previous_bundle_state = Some(bundle_state.clone());
 
         best_payload.set(payload.clone());
         self.ws_pub
@@ -246,12 +249,12 @@ where
             // return early since we don't need to build a block with transactions from the pool
             return Ok(());
         }
-        let gas_per_batch = ctx.block_gas_limit() / self.config.flashblocks_per_block();
+        let gas_per_batch = ctx.block_gas_limit() / self.config.specific.flashblocks_per_block;
         let mut total_gas_per_batch = gas_per_batch;
         let da_per_batch = ctx
             .da_config
             .max_da_block_size()
-            .map(|da_limit| da_limit / self.config.flashblocks_per_block());
+            .map(|da_limit| da_limit / self.config.specific.flashblocks_per_block);
         // Check that builder tx won't affect fb limit too much
         if let Some(da_limit) = da_per_batch {
             // We error if we can't insert any tx aside from builder tx in flashblock
@@ -261,14 +264,14 @@ where
         }
         let mut total_da_per_batch = da_per_batch;
 
-        let last_flashblock = self.config.flashblocks_per_block().saturating_sub(1);
+        let last_flashblock = self.config.specific.flashblocks_per_block.saturating_sub(1);
         let mut flashblock_count = 0;
         // Create a channel to coordinate flashblock building
         let (build_tx, mut build_rx) = mpsc::channel(1);
 
         // Spawn the timer task that signals when to build a new flashblock
         let cancel_clone = ctx.cancel.clone();
-        let interval = self.config.specific.interval;
+        let interval = self.config.specific.build_interval;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
             loop {
@@ -282,12 +285,16 @@ where
                         }
                     }
                 _ = interval.tick() => {
-                            if let Err(err) = build_tx.send(()).await {
-                                error!(target: "payload_builder", "Error sending build signal: {}", err);
-                                break;
-                            }
+                    if let Err(err) = build_tx.send(()).await {
+                        if build_tx.is_closed() || cancel_clone.is_cancelled() {
+                            debug!(target: "payload_builder", "Building is stopped");
+                            break;
                         }
-                }
+
+                        error!(target: "payload_builder", "Error sending build signal: {}", err);
+                        break;
+                    }
+                }}
             }
         });
 
@@ -319,6 +326,19 @@ where
                         return None;
                     }
 
+                    // If we've built all the flashblocks, no more work to do
+                    if flashblock_count >= self.config.specific.flashblocks_per_block {
+                        tracing::info!(
+                            target: "payload_builder",
+                            target = self.config.specific.flashblocks_per_block,
+                            flashblock_count = flashblock_count,
+                            block_number = ctx.block_number(),
+                            "Built all flashblocks, stopping payload builder",
+                        );
+
+                        return None;
+                    }
+
                     // Wait for next message
                     build_rx.recv().await
                 })
@@ -327,17 +347,6 @@ where
             // Exit loop if channel closed or cancelled
             match received {
                 Some(()) => {
-                    if flashblock_count >= self.config.flashblocks_per_block() {
-                        tracing::info!(
-                            target: "payload_builder",
-                            target = self.config.flashblocks_per_block(),
-                            flashblock_count = flashblock_count,
-                            block_number = ctx.block_number(),
-                            "Skipping flashblock reached target",
-                        );
-                        continue;
-                    }
-
                     // Continue with flashblock building
                     tracing::info!(
                         target: "payload_builder",
@@ -349,6 +358,7 @@ where
                         da_used = info.cumulative_da_bytes_used,
                         "Building flashblock",
                     );
+
                     let flashblock_build_start_time = Instant::now();
                     let state = StateProviderDatabase::new(&state_provider);
                     invoke_on_first_flashblock(flashblock_count, || {
@@ -395,7 +405,7 @@ where
                     if ctx.cancel.is_cancelled() {
                         tracing::info!(
                             target: "payload_builder",
-                            "Job cancelled, stopping payload building",
+                            "Job cancelled, stopping payload building block_number={}", ctx.block_number()
                         );
                         // if the job was cancelled, stop
                         return Ok(());
@@ -412,7 +422,7 @@ where
                     });
 
                     let total_block_built_duration = Instant::now();
-                    let build_result = build_block(db, &ctx, &mut info);
+                    let build_result = build_block(db, &ctx, &mut info, previous_bundle_state.as_ref());
                     ctx.metrics
                         .total_block_built_duration
                         .record(total_block_built_duration.elapsed());
@@ -447,7 +457,9 @@ where
 
                             best_payload.set(new_payload.clone());
                             // Update bundle_state for next iteration
-                            bundle_state = new_bundle_state;
+                            bundle_state = new_bundle_state.clone();
+                            // Update cache for next flashblock
+                            previous_bundle_state = Some(new_bundle_state);
                             total_gas_per_batch += gas_per_batch;
                             if let Some(da_limit) = da_per_batch {
                                 if let Some(da) = total_da_per_batch.as_mut() {
@@ -468,7 +480,6 @@ where
                     }
                 }
                 None => {
-                    // Exit loop if channel closed or cancelled
                     self.metrics.block_built_success.increment(1);
                     self.metrics
                         .flashblock_count
@@ -478,6 +489,7 @@ where
                         message = "Payload building complete, channel closed or job cancelled"
                     );
                     span.record("flashblock_count", flashblock_count);
+                    tracing::info!(target: "payload_builder", "Completed block building block={} flashblock_count={}", ctx.block_number(), flashblock_count);
                     return Ok(());
                 }
             }
@@ -532,6 +544,7 @@ fn build_block<DB, P>(
     mut state: State<DB>,
     ctx: &OpPayloadBuilderCtx,
     info: &mut ExecutionInfo<ExtraExecutionInfo>,
+    previous_bundle_state: Option<&BundleState>,
 ) -> Result<(OpBuiltPayload, FlashblocksPayloadV1, BundleState), PayloadBuilderError>
 where
     DB: Database<Error = ProviderError> + AsRef<P>,
@@ -551,8 +564,31 @@ where
     let block_number = ctx.block_number();
     assert_eq!(block_number, ctx.parent().number + 1);
 
+    // Compute bundle diff for optimized state root calculation
+    let fb_state_diff_time = Instant::now();
+    let bundle_for_state_root = match previous_bundle_state {
+        Some(prev_bundle) => {
+            compute_bundle_state_diff(prev_bundle, &new_bundle)
+        }
+        None => {
+            // First flashblock - use full bundle
+            new_bundle.clone()
+        }
+    };
+    ctx.metrics
+        .fb_state_diff_duration
+        .record(fb_state_diff_time.elapsed());
+
     let execution_outcome = ExecutionOutcome::new(
         new_bundle.clone(),
+        vec![info.receipts.clone()],
+        block_number,
+        vec![],
+    );
+
+    // Create separate execution outcome for state root calculation using diff
+    let state_root_execution_outcome = ExecutionOutcome::new(
+        bundle_for_state_root,
         vec![info.receipts.clone()],
         block_number,
         vec![],
@@ -571,10 +607,16 @@ where
         .block_logs_bloom(block_number)
         .expect("Number is in range");
 
-    // // calculate the state root
+    // // calculate the state root using optimized diff bundle
     let state_root_start_time = Instant::now();
     let state_provider = state.database.as_ref();
-    let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
+    let hash_state_start_time = Instant::now();
+    let hashed_state = state_provider.hashed_post_state(state_root_execution_outcome.state());
+    ctx.metrics
+        .hashed_state_duration
+        .record(hash_state_start_time.elapsed());
+
+    let state_root_with_updates_start_time = Instant::now();
     let (state_root, _trie_output) = {
         state
             .database
@@ -588,6 +630,25 @@ where
                 );
             })?
     };
+    ctx.metrics
+        .state_root_update_duration
+        .record(state_root_with_updates_start_time.elapsed());
+
+    info!("state_root: {:?}", state_root);
+
+    // let consistent_db_view = ConsistentDbView::new(state_provider.clone(), Some((ctx.parent().hash(), ctx.parent().number)));
+
+    // // TODO: use eth-sparse-mpt to calculate state root
+    // let state_root = eth_sparse_mpt::calculate_root_hash_with_sparse_trie(
+    //     consistent_db_view,
+    //     &execution_outcome,
+    //     sparse_trie_shared_cache
+    //     &mut ctx.local_cache,
+    //     &None,
+    //     ETHSpareMPTVersion::V2,
+    // );
+
+
     ctx.metrics
         .state_root_calculation_duration
         .record(state_root_start_time.elapsed());
@@ -753,4 +814,51 @@ pub fn invoke_on_last_flashblock<F: FnOnce()>(
     if current_flashblock == flashblock_limit {
         fun()
     }
+}
+
+/// Computes the difference between two bundle states, returning only the changed accounts.
+/// This optimization reduces the amount of data processed during state root calculation.
+fn compute_bundle_state_diff(previous: &BundleState, current: &BundleState) -> BundleState {
+    // Create a new bundle with only the changed accounts
+    let mut diff_bundle = current.clone();
+    
+    // Collect addresses of changed accounts
+    let mut changed_addresses = std::collections::HashSet::new();
+    
+    // Filter out unchanged accounts from the state
+    diff_bundle.state.retain(|address, current_account| {
+        let should_keep = match previous.account(address) {
+            Some(prev_account) => {
+                // Keep if account info or storage changed
+                current_account.info != prev_account.info || 
+                current_account.storage != prev_account.storage ||
+                current_account.status != prev_account.status
+            }
+            None => {
+                // Keep if it's a new account
+                true
+            }
+        };
+        
+        if should_keep {
+            changed_addresses.insert(*address);
+        }
+        should_keep
+    });
+    
+    // Filter reverts to only include those for changed accounts
+    for revert_level in diff_bundle.reverts.iter_mut() {
+        revert_level.retain(|(address, _)| changed_addresses.contains(address));
+    }
+    
+    // Clear contracts for state root calculation optimization (not needed for state root)
+    diff_bundle.contracts.clear();
+    
+    // Update size fields to reflect the actual diff state
+    diff_bundle.state_size = diff_bundle.state.len();
+    diff_bundle.reverts_size = diff_bundle.reverts.iter().map(|level| level.len()).sum();
+
+    info!("diff_bundle: {:?}", diff_bundle);
+    
+    diff_bundle
 }
