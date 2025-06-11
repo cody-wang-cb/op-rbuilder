@@ -76,6 +76,12 @@ pub struct OpRBuilderMetrics {
     pub da_block_size_limit: Gauge,
     /// Da tx size limit
     pub da_tx_size_limit: Gauge,
+    /// Duration of flashblock state diff
+    pub fb_state_diff_duration: Histogram,
+    /// Duration of getting hashed state
+    pub hashed_state_duration: Histogram,
+    /// Duration of state root update duration
+    pub state_root_update_duration: Histogram,
 }
 
 /// Contains version information for the application.

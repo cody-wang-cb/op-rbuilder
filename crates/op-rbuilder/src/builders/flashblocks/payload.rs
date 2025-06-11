@@ -565,6 +565,7 @@ where
     assert_eq!(block_number, ctx.parent().number + 1);
 
     // Compute bundle diff for optimized state root calculation
+    let fb_state_diff_time = Instant::now();
     let bundle_for_state_root = match previous_bundle_state {
         Some(prev_bundle) => {
             compute_bundle_state_diff(prev_bundle, &new_bundle)
@@ -574,6 +575,9 @@ where
             new_bundle.clone()
         }
     };
+    ctx.metrics
+        .fb_state_diff_duration
+        .record(fb_state_diff_time.elapsed());
 
     let execution_outcome = ExecutionOutcome::new(
         new_bundle.clone(),
@@ -606,7 +610,13 @@ where
     // // calculate the state root using optimized diff bundle
     let state_root_start_time = Instant::now();
     let state_provider = state.database.as_ref();
+    let hash_state_start_time = Instant::now();
     let hashed_state = state_provider.hashed_post_state(state_root_execution_outcome.state());
+    ctx.metrics
+        .hashed_state_duration
+        .record(hash_state_start_time.elapsed());
+
+    let state_root_with_updates_start_time = Instant::now();
     let (state_root, _trie_output) = {
         state
             .database
@@ -620,6 +630,9 @@ where
                 );
             })?
     };
+    ctx.metrics
+        .state_root_update_duration
+        .record(state_root_with_updates_start_time.elapsed());
 
     info!("state_root: {:?}", state_root);
 
