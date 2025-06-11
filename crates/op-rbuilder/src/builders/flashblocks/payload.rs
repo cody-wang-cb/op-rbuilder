@@ -29,8 +29,7 @@ use reth_optimism_node::{OpBuiltPayload, OpPayloadBuilderAttributes};
 use reth_optimism_primitives::{OpPrimitives, OpReceipt, OpTransactionSigned};
 use reth_payload_util::BestPayloadTransactions;
 use reth_provider::{
-    ExecutionOutcome, HashedPostStateProvider, ProviderError, StateRootProvider,
-    StorageRootProvider,
+    ExecutionOutcome, HashedPostStateProvider, ProviderError, StateRootProvider, StorageRootProvider
 };
 use reth_revm::{
     database::StateProviderDatabase,
@@ -44,6 +43,7 @@ use rollup_boost::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, error, metadata::Level, span, warn};
+use eth_sparse_mpt::*;
 
 #[derive(Debug, Default)]
 struct ExtraExecutionInfo {
@@ -135,6 +135,8 @@ where
         args: BuildArguments<OpPayloadBuilderAttributes<OpTransactionSigned>, OpBuiltPayload>,
         best_payload: BlockCell<OpBuiltPayload>,
     ) -> Result<(), PayloadBuilderError> {
+        // Cache for bundle state diff optimization
+        let mut previous_bundle_state: Option<BundleState> = None;
         let block_build_start_time = Instant::now();
         let BuildArguments { config, cancel, .. } = args;
 
@@ -193,6 +195,7 @@ where
 
         let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
         let state = StateProviderDatabase::new(&state_provider);
+        let _sparse_trie_shared_cache = SparseTrieSharedCache::new_with_parent_block_data(ctx.parent().hash(), ctx.parent().state_root);
 
         // 1. execute the pre steps and seal an early block with that
         let sequencer_tx_start_time = Instant::now();
@@ -216,7 +219,10 @@ where
             .sequencer_tx_duration
             .record(sequencer_tx_start_time.elapsed());
 
-        let (payload, fb_payload, mut bundle_state) = build_block(db, &ctx, &mut info)?;
+                        let (payload, fb_payload, mut bundle_state) = build_block(db, &ctx, &mut info, previous_bundle_state.as_ref())?;
+
+        // Update cache for next flashblock
+        previous_bundle_state = Some(bundle_state.clone());
 
         best_payload.set(payload.clone());
         self.ws_pub
@@ -412,7 +418,7 @@ where
                     });
 
                     let total_block_built_duration = Instant::now();
-                    let build_result = build_block(db, &ctx, &mut info);
+                    let build_result = build_block(db, &ctx, &mut info, previous_bundle_state.as_ref());
                     ctx.metrics
                         .total_block_built_duration
                         .record(total_block_built_duration.elapsed());
@@ -447,7 +453,9 @@ where
 
                             best_payload.set(new_payload.clone());
                             // Update bundle_state for next iteration
-                            bundle_state = new_bundle_state;
+                            bundle_state = new_bundle_state.clone();
+                            // Update cache for next flashblock
+                            previous_bundle_state = Some(new_bundle_state);
                             total_gas_per_batch += gas_per_batch;
                             if let Some(da_limit) = da_per_batch {
                                 if let Some(da) = total_da_per_batch.as_mut() {
@@ -532,6 +540,7 @@ fn build_block<DB, P>(
     mut state: State<DB>,
     ctx: &OpPayloadBuilderCtx,
     info: &mut ExecutionInfo<ExtraExecutionInfo>,
+    previous_bundle_state: Option<&BundleState>,
 ) -> Result<(OpBuiltPayload, FlashblocksPayloadV1, BundleState), PayloadBuilderError>
 where
     DB: Database<Error = ProviderError> + AsRef<P>,
@@ -551,8 +560,27 @@ where
     let block_number = ctx.block_number();
     assert_eq!(block_number, ctx.parent().number + 1);
 
+    // Compute bundle diff for optimized state root calculation
+    let bundle_for_state_root = match previous_bundle_state {
+        Some(prev_bundle) => {
+            compute_bundle_state_diff(prev_bundle, &new_bundle)
+        }
+        None => {
+            // First flashblock - use full bundle
+            new_bundle.clone()
+        }
+    };
+
     let execution_outcome = ExecutionOutcome::new(
         new_bundle.clone(),
+        vec![info.receipts.clone()],
+        block_number,
+        vec![],
+    );
+
+    // Create separate execution outcome for state root calculation using diff
+    let state_root_execution_outcome = ExecutionOutcome::new(
+        bundle_for_state_root,
         vec![info.receipts.clone()],
         block_number,
         vec![],
@@ -571,10 +599,10 @@ where
         .block_logs_bloom(block_number)
         .expect("Number is in range");
 
-    // // calculate the state root
+    // // calculate the state root using optimized diff bundle
     let state_root_start_time = Instant::now();
     let state_provider = state.database.as_ref();
-    let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
+    let hashed_state = state_provider.hashed_post_state(state_root_execution_outcome.state());
     let (state_root, _trie_output) = {
         state
             .database
@@ -588,6 +616,20 @@ where
                 );
             })?
     };
+
+    // let consistent_db_view = ConsistentDbView::new(state_provider.clone(), Some((ctx.parent().hash(), ctx.parent().number)));
+
+    // // TODO: use eth-sparse-mpt to calculate state root
+    // let state_root = eth_sparse_mpt::calculate_root_hash_with_sparse_trie(
+    //     consistent_db_view,
+    //     &execution_outcome,
+    //     sparse_trie_shared_cache
+    //     &mut ctx.local_cache,
+    //     &None,
+    //     ETHSpareMPTVersion::V2,
+    // );
+
+
     ctx.metrics
         .state_root_calculation_duration
         .record(state_root_start_time.elapsed());
@@ -753,4 +795,33 @@ pub fn invoke_on_last_flashblock<F: FnOnce()>(
     if current_flashblock == flashblock_limit {
         fun()
     }
+}
+
+/// Computes the difference between two bundle states, returning only the changed accounts.
+/// This optimization reduces the amount of data processed during state root calculation.
+fn compute_bundle_state_diff(previous: &BundleState, current: &BundleState) -> BundleState {
+    // Create a new bundle with only the changed accounts
+    let mut diff_bundle = current.clone();
+    
+    // Filter out unchanged accounts from the state
+    diff_bundle.state.retain(|address, current_account| {
+        match previous.account(address) {
+            Some(prev_account) => {
+                // Keep if account info or storage changed
+                current_account.info != prev_account.info || 
+                current_account.storage != prev_account.storage ||
+                current_account.status != prev_account.status
+            }
+            None => {
+                // Keep if it's a new account
+                true
+            }
+        }
+    });
+    
+    // Clear contracts and reverts for state root calculation optimization
+    diff_bundle.contracts.clear();
+    diff_bundle.reverts.clear();
+    
+    diff_bundle
 }
