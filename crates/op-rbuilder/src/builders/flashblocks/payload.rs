@@ -55,6 +55,7 @@ struct StateRootJob {
     block_body: BlockBody<OpTransactionSigned>,
     payload_id: reth::payload::PayloadId,
     total_fees: U256,
+    fb_payload: FlashblocksPayloadV1,
 }
 
 #[derive(Debug)]
@@ -118,7 +119,7 @@ struct AsyncStateRootManager {
 }
 
 impl AsyncStateRootManager {
-    fn new<Client>(client: Client, metrics: Arc<OpRBuilderMetrics>) -> Self
+    fn new<Client>(client: Client, metrics: Arc<OpRBuilderMetrics>, ws_pub: Arc<WebSocketPublisher>) -> Self
     where
         Client: ClientBounds + 'static,
     {
@@ -135,6 +136,7 @@ impl AsyncStateRootManager {
             let job_rx_clone = Arc::clone(&job_rx_shared);
             let completed_payloads_clone = Arc::clone(&completed_payloads);
             let metrics_clone = Arc::clone(&metrics);
+            let ws_pub_clone = Arc::clone(&ws_pub);
 
             tokio::spawn(async move {
                 Self::worker_task(
@@ -143,6 +145,7 @@ impl AsyncStateRootManager {
                     job_rx_clone,
                     completed_payloads_clone,
                     metrics_clone,
+                    ws_pub_clone,
                 )
                 .await;
             });
@@ -160,6 +163,7 @@ impl AsyncStateRootManager {
         job_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<StateRootJob>>>,
         completed_payloads: Arc<tokio::sync::Mutex<CompletedPayloads>>,
         metrics: Arc<OpRBuilderMetrics>,
+        ws_pub: Arc<WebSocketPublisher>,
     ) where
         Client: ClientBounds + 'static,
     {
@@ -173,7 +177,7 @@ impl AsyncStateRootManager {
             };
 
             match job {
-                Some(job) => {
+                Some(mut job) => {
                     info!(target: "payload_builder",
                         worker_id = worker_id,
                         block_number = job.block_number,
@@ -190,14 +194,39 @@ impl AsyncStateRootManager {
                         let mut final_header = job.unsealed_header;
                         final_header.state_root = state_root;
 
-                        // Seal the block
+                        // Seal the block to get the real block hash
                         let sealed_block = Arc::new(
                             alloy_consensus::Block::<OpTransactionSigned>::new(
                                 final_header,
-                                job.block_body,
+                                job.block_body.clone(),
                             )
                             .seal_slow(),
                         );
+
+                        let block_hash = sealed_block.hash();
+
+                        // Update the flashblock payload with real values
+                        job.fb_payload.diff.state_root = state_root;
+                        job.fb_payload.diff.block_hash = block_hash;
+
+                        // Publish the updated flashblock payload
+                        if let Err(e) = ws_pub.publish(&job.fb_payload) {
+                            warn!(target: "payload_builder",
+                                worker_id = worker_id,
+                                block_number = job.block_number,
+                                flashblock_index = job.flashblock_index,
+                                "Failed to publish flashblock: {}", e
+                            );
+                        } else {
+                            info!(target: "payload_builder",
+                                worker_id = worker_id,
+                                block_number = job.block_number,
+                                flashblock_index = job.flashblock_index,
+                                state_root = %state_root,
+                                block_hash = %block_hash,
+                                "Published flashblock with real state root and block hash"
+                            );
+                        }
 
                         // Create final payload
                         let final_payload =
@@ -278,6 +307,7 @@ impl AsyncStateRootManager {
         block_body: BlockBody<OpTransactionSigned>,
         payload_id: reth::payload::PayloadId,
         total_fees: U256,
+        fb_payload: FlashblocksPayloadV1,
     ) -> bool {
         let job = StateRootJob {
             block_number,
@@ -287,6 +317,7 @@ impl AsyncStateRootManager {
             block_body,
             payload_id,
             total_fees,
+            fb_payload,
         };
 
         // Submit job and return whether it was successful (fire-and-forget)
@@ -354,10 +385,11 @@ where
         config: BuilderConfig<FlashblocksConfig>,
     ) -> eyre::Result<Self> {
         let metrics = Arc::new(OpRBuilderMetrics::default());
-        let ws_pub = WebSocketPublisher::new(config.specific.ws_addr, Arc::clone(&metrics))?.into();
+        let ws_pub: Arc<WebSocketPublisher> = WebSocketPublisher::new(config.specific.ws_addr, Arc::clone(&metrics))?.into();
         let state_root_manager = Arc::new(AsyncStateRootManager::new(
             client.clone(),
             Arc::clone(&metrics),
+            Arc::clone(&ws_pub),
         ));
 
         Ok(Self {
@@ -715,9 +747,6 @@ where
                             fb_payload.index = flashblock_count + 1; // we do this because the fallback block is index 0
                             fb_payload.base = None;
 
-                            self.ws_pub
-                                .publish(&fb_payload)
-                                .map_err(PayloadBuilderError::other)?;
 
                             // Record flashblock build duration
                             self.metrics
@@ -1228,6 +1257,7 @@ where
         block_body,
         ctx.payload_id(),
         info.total_fees,
+        fb_payload.clone(),
     );
 
     if job_submitted {
