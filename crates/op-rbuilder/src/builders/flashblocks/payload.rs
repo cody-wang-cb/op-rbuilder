@@ -41,8 +41,7 @@ use rollup_boost::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, error, metadata::Level, span, warn};
-use eth_sparse_mpt::*;
+use tracing::{debug, error, metadata::Level, span, warn, info};
 
 #[derive(Debug, Default)]
 struct ExtraExecutionInfo {
@@ -194,7 +193,6 @@ where
 
         let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
         let state = StateProviderDatabase::new(&state_provider);
-        let _sparse_trie_shared_cache = SparseTrieSharedCache::new_with_parent_block_data(ctx.parent().hash(), ctx.parent().state_root);
 
         // 1. execute the pre steps and seal an early block with that
         let sequencer_tx_start_time = Instant::now();
@@ -623,6 +621,8 @@ where
             })?
     };
 
+    info!("state_root: {:?}", state_root);
+
     // let consistent_db_view = ConsistentDbView::new(state_provider.clone(), Some((ctx.parent().hash(), ctx.parent().number)));
 
     // // TODO: use eth-sparse-mpt to calculate state root
@@ -809,9 +809,12 @@ fn compute_bundle_state_diff(previous: &BundleState, current: &BundleState) -> B
     // Create a new bundle with only the changed accounts
     let mut diff_bundle = current.clone();
     
+    // Collect addresses of changed accounts
+    let mut changed_addresses = std::collections::HashSet::new();
+    
     // Filter out unchanged accounts from the state
     diff_bundle.state.retain(|address, current_account| {
-        match previous.account(address) {
+        let should_keep = match previous.account(address) {
             Some(prev_account) => {
                 // Keep if account info or storage changed
                 current_account.info != prev_account.info || 
@@ -822,12 +825,27 @@ fn compute_bundle_state_diff(previous: &BundleState, current: &BundleState) -> B
                 // Keep if it's a new account
                 true
             }
+        };
+        
+        if should_keep {
+            changed_addresses.insert(*address);
         }
+        should_keep
     });
     
-    // Clear contracts and reverts for state root calculation optimization
+    // Filter reverts to only include those for changed accounts
+    for revert_level in diff_bundle.reverts.iter_mut() {
+        revert_level.retain(|(address, _)| changed_addresses.contains(address));
+    }
+    
+    // Clear contracts for state root calculation optimization (not needed for state root)
     diff_bundle.contracts.clear();
-    diff_bundle.reverts.clear();
+    
+    // Update size fields to reflect the actual diff state
+    diff_bundle.state_size = diff_bundle.state.len();
+    diff_bundle.reverts_size = diff_bundle.reverts.iter().map(|level| level.len()).sum();
+
+    info!("diff_bundle: {:?}", diff_bundle);
     
     diff_bundle
 }
