@@ -50,6 +50,12 @@ pub struct OpRBuilderMetrics {
     pub transaction_pool_fetch_duration: Histogram,
     /// Duration of state root calculation
     pub state_root_calculation_duration: Histogram,
+    /// Duration of getting hashed state
+    pub hashed_state_duration: Histogram,
+    /// Duration of state root update duration
+    pub state_root_update_duration: Histogram,
+    /// Duration of state root calculation task
+    pub state_root_calculation_task_duration: Histogram,
     /// Duration of sequencer transaction execution
     pub sequencer_tx_duration: Histogram,
     /// Duration of state merge transitions
@@ -76,6 +82,8 @@ pub struct OpRBuilderMetrics {
     pub da_block_size_limit: Gauge,
     /// Da tx size limit
     pub da_tx_size_limit: Gauge,
+    /// Duration of state root job task
+    pub state_root_job_task_duration: Histogram,
 }
 
 /// Contains version information for the application.

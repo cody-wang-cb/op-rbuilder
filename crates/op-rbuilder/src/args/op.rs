@@ -93,11 +93,36 @@ pub struct FlashblocksArgs {
     )]
     pub flashblocks_addr: String,
 
-    /// flashblock block time in milliseconds
+    /// Number of Flashblocks per block
     #[arg(
-        long = "flashblocks.block-time",
-        default_value = "250",
-        env = "FLASHBLOCK_BLOCK_TIME"
+        long = "flashblocks.per-block",
+        default_value = "10",
+        env = "FLASHBLOCKS_PER_BLOCK"
     )]
-    pub flashblocks_block_time: u64,
+    pub flashblocks_per_block: u64,
+
+    /// Overhead for reset of block production (e.g. new payload request to sequencer EL)
+    #[arg(
+        long = "flashblocks.block-overhead",
+        default_value = "100",
+        env = "FLASHBLOCK_BLOCK_OVERHEAD"
+    )]
+    pub flashblocks_block_overhead: u64,
+
+    /// Number of worker threads for async state root calculation
+    #[arg(
+        long = "flashblocks.state-root-workers",
+        default_value = "4",
+        env = "FLASHBLOCKS_STATE_ROOT_WORKERS"
+    )]
+    pub state_root_workers: usize,
+
+    /// Whether to run state root calculation asynchronously
+    /// When false, all flashblocks will use synchronous state root calculation
+    #[arg(
+        long = "flashblocks.run-state-root-async",
+        default_value = "false",
+        env = "FLASHBLOCKS_RUN_STATE_ROOT_ASYNC"
+    )]
+    pub run_state_root_async: bool,
 }
