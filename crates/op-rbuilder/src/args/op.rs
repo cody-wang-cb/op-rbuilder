@@ -108,4 +108,12 @@ pub struct FlashblocksArgs {
         env = "FLASHBLOCK_BLOCK_OVERHEAD"
     )]
     pub flashblocks_block_overhead: u64,
+
+    /// Number of worker threads for async state root calculation
+    #[arg(
+        long = "flashblocks.state-root-workers",
+        default_value = "4",
+        env = "FLASHBLOCKS_STATE_ROOT_WORKERS"
+    )]
+    pub state_root_workers: usize,
 }

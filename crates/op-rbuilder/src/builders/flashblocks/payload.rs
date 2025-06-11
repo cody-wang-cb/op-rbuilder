@@ -80,8 +80,11 @@ impl CompletedPayloads {
         flashblock_index: u64,
         block_number: u64,
     ) -> bool {
-        info!(target: "payload_builder", "Trying to insert payload with flashblock index: {}", flashblock_index);
-        info!(target: "payload_builder", "Max flashblock index: {}", self.max_flashblock_index);
+        info!(
+            target: "payload_builder", "Trying to insert payload with flashblock index: {}, current max flashblock index: {}",
+            flashblock_index,
+            self.max_flashblock_index
+        );
 
         // Reset if new block detected
         if block_number != self.current_block_number {
@@ -97,9 +100,9 @@ impl CompletedPayloads {
         if flashblock_index > self.max_flashblock_index {
             self.payloads.push(payload);
             self.max_flashblock_index = flashblock_index;
-            true // Inserted
+            true
         } else {
-            false // Rejected as outdated
+            false
         }
     }
 
@@ -119,7 +122,12 @@ struct AsyncStateRootManager {
 }
 
 impl AsyncStateRootManager {
-    fn new<Client>(client: Client, metrics: Arc<OpRBuilderMetrics>, ws_pub: Arc<WebSocketPublisher>) -> Self
+    fn new<Client>(
+        client: Client,
+        metrics: Arc<OpRBuilderMetrics>,
+        ws_pub: Arc<WebSocketPublisher>,
+        num_workers: usize,
+    ) -> Self
     where
         Client: ClientBounds + 'static,
     {
@@ -129,9 +137,8 @@ impl AsyncStateRootManager {
         // Create shared job receiver for multiple workers
         let job_rx_shared = Arc::new(tokio::sync::Mutex::new(job_rx));
 
-        // Spawn 4 worker tasks
-        const NUM_WORKERS: usize = 4;
-        for worker_id in 0..NUM_WORKERS {
+        // Spawn configurable number of worker tasks
+        for worker_id in 0..num_workers {
             let client_clone = client.clone();
             let job_rx_clone = Arc::clone(&job_rx_shared);
             let completed_payloads_clone = Arc::clone(&completed_payloads);
@@ -178,6 +185,8 @@ impl AsyncStateRootManager {
 
             match job {
                 Some(mut job) => {
+                    let job_start_time = Instant::now();
+
                     info!(target: "payload_builder",
                         worker_id = worker_id,
                         block_number = job.block_number,
@@ -205,30 +214,18 @@ impl AsyncStateRootManager {
 
                         let block_hash = sealed_block.hash();
 
-                        // Update the flashblock payload with real values
+                        // Update the flashblock payload
                         job.fb_payload.diff.state_root = state_root;
                         job.fb_payload.diff.block_hash = block_hash;
-
-                        // Update index and base
-                        job.fb_payload.index = job.flashblock_index + 1;
+                        job.fb_payload.index = job.flashblock_index;
                         job.fb_payload.base = None;
 
-                        // Publish the updated flashblock payload
                         if let Err(e) = ws_pub.publish(&job.fb_payload) {
                             warn!(target: "payload_builder",
                                 worker_id = worker_id,
                                 block_number = job.block_number,
                                 flashblock_index = job.flashblock_index,
                                 "Failed to publish flashblock: {}", e
-                            );
-                        } else {
-                            info!(target: "payload_builder",
-                                worker_id = worker_id,
-                                block_number = job.block_number,
-                                flashblock_index = job.flashblock_index,
-                                state_root = %state_root,
-                                block_hash = %block_hash,
-                                "Published flashblock with real state root and block hash"
                             );
                         }
 
@@ -270,6 +267,10 @@ impl AsyncStateRootManager {
                             "Worker failed to calculate state root"
                         );
                     }
+
+                    metrics
+                        .state_root_job_task_duration
+                        .record(job_start_time.elapsed());
                 }
                 None => {
                     info!(target: "payload_builder", worker_id = worker_id, "Worker shutting down - channel closed");
@@ -324,18 +325,16 @@ impl AsyncStateRootManager {
             fb_payload,
         };
 
-        // Submit job and return whether it was successful (fire-and-forget)
         self.job_tx.send(job).is_ok()
     }
 
     async fn get_latest_completed_payload(&self) -> Option<OpBuiltPayload> {
         let mut payloads = self.completed_payloads.lock().await;
         if payloads.is_empty() {
-            debug!(target: "payload_builder", "No completed payloads available");
+            info!(target: "payload_builder", "No completed payloads available");
             return None;
         }
 
-        // Take the most recent payload (last in the vector)
         let latest_payload = payloads.pop_latest();
 
         if let Some(ref payload) = latest_payload {
@@ -389,11 +388,13 @@ where
         config: BuilderConfig<FlashblocksConfig>,
     ) -> eyre::Result<Self> {
         let metrics = Arc::new(OpRBuilderMetrics::default());
-        let ws_pub: Arc<WebSocketPublisher> = WebSocketPublisher::new(config.specific.ws_addr, Arc::clone(&metrics))?.into();
+        let ws_pub: Arc<WebSocketPublisher> =
+            WebSocketPublisher::new(config.specific.ws_addr, Arc::clone(&metrics))?.into();
         let state_root_manager = Arc::new(AsyncStateRootManager::new(
             client.clone(),
             Arc::clone(&metrics),
             Arc::clone(&ws_pub),
+            config.specific.state_root_workers,
         ));
 
         Ok(Self {
@@ -1216,21 +1217,7 @@ where
     let fb_payload = FlashblocksPayloadV1 {
         payload_id: ctx.payload_id(),
         index: 0,
-        base: Some(ExecutionPayloadBaseV1 {
-            parent_beacon_block_root: ctx
-                .attributes()
-                .payload_attributes
-                .parent_beacon_block_root
-                .unwrap(),
-            parent_hash: ctx.parent().hash(),
-            fee_recipient: ctx.attributes().suggested_fee_recipient(),
-            prev_randao: ctx.attributes().payload_attributes.prev_randao,
-            block_number: ctx.parent().number + 1,
-            gas_limit: ctx.block_gas_limit(),
-            timestamp: ctx.attributes().payload_attributes.timestamp,
-            extra_data: ctx.extra_data()?,
-            base_fee_per_gas: ctx.base_fee().try_into().unwrap(),
-        }),
+        base: None, // no need for base since it won't be the first flashblock
         diff: ExecutionPayloadFlashblockDeltaV1 {
             state_root: placeholder_state_root,
             receipts_root,

@@ -19,6 +19,9 @@ pub struct FlashblocksConfig {
     /// Each block will contain one or more flashblocks. On average, the number of flashblocks
     /// per block is equal to the block time divided by the flashblock interval.
     pub build_interval: Duration,
+
+    /// Number of worker threads for async state root calculation
+    pub state_root_workers: usize,
 }
 
 impl Default for FlashblocksConfig {
@@ -27,6 +30,7 @@ impl Default for FlashblocksConfig {
             ws_addr: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 1111),
             build_interval: Duration::from_millis(225),
             flashblocks_per_block: 10,
+            state_root_workers: 4,
         }
     }
 }
@@ -54,6 +58,7 @@ impl TryFrom<OpRbuilderArgs> for FlashblocksConfig {
             ws_addr,
             build_interval,
             flashblocks_per_block: args.flashblocks.flashblocks_per_block,
+            state_root_workers: args.flashblocks.state_root_workers,
         })
     }
 }

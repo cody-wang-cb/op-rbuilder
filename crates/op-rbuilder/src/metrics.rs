@@ -78,6 +78,8 @@ pub struct OpRBuilderMetrics {
     pub da_block_size_limit: Gauge,
     /// Da tx size limit
     pub da_tx_size_limit: Gauge,
+    /// Duration of state root job task
+    pub state_root_job_task_duration: Histogram,
 }
 
 /// Contains version information for the application.
