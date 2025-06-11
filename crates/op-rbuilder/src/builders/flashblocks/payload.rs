@@ -209,6 +209,10 @@ impl AsyncStateRootManager {
                         job.fb_payload.diff.state_root = state_root;
                         job.fb_payload.diff.block_hash = block_hash;
 
+                        // Update index and base
+                        job.fb_payload.index = job.flashblock_index + 1;
+                        job.fb_payload.base = None;
+
                         // Publish the updated flashblock payload
                         if let Err(e) = ws_pub.publish(&job.fb_payload) {
                             warn!(target: "payload_builder",
@@ -744,10 +748,6 @@ where
                             return Err(err);
                         }
                         Ok((completed_payload_opt, mut fb_payload, new_bundle_state)) => {
-                            fb_payload.index = flashblock_count + 1; // we do this because the fallback block is index 0
-                            fb_payload.base = None;
-
-
                             // Record flashblock build duration
                             self.metrics
                                 .flashblock_build_duration
