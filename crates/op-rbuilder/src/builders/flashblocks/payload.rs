@@ -936,8 +936,14 @@ where
     // Calculate state root synchronously
     let state_root_start_time = Instant::now();
     let state_provider = state.database.as_ref();
-    let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
 
+    let hashed_state_start_time = Instant::now();
+    let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
+    ctx.metrics
+        .hashed_state_duration
+        .record(hashed_state_start_time.elapsed());
+
+    let state_root_with_updates_start_time = Instant::now();
     let (state_root, _trie_output) = state
         .database
         .as_ref()
@@ -949,6 +955,9 @@ where
                 "failed to calculate state root for payload"
             );
         })?;
+    ctx.metrics
+        .state_root_update_duration
+        .record(state_root_with_updates_start_time.elapsed());
 
     ctx.metrics
         .state_root_calculation_duration
