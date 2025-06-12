@@ -31,9 +31,7 @@ use reth_optimism_node::{OpBuiltPayload, OpPayloadBuilderAttributes};
 use reth_optimism_primitives::{OpPrimitives, OpReceipt, OpTransactionSigned};
 use reth_payload_util::BestPayloadTransactions;
 use reth_provider::{
-    providers::ConsistentDbView, BlockReader, DatabaseProviderFactory, ExecutionOutcome,
-    HashedPostStateProvider, ProviderError, StateCommitmentProvider, StateRootProvider,
-    StorageRootProvider,
+    providers::ConsistentDbView, BlockNumReader, BlockReader, DatabaseProviderFactory, ExecutionOutcome, HashedPostStateProvider, HeaderProvider, ProviderError, StateCommitmentProvider, StateRootProvider, StorageRootProvider
 };
 use reth_provider::{BlockHashReader, StateProvider};
 use reth_revm::{
@@ -205,7 +203,7 @@ where
                 ctx.parent().hash(),
                 ctx.parent().state_root,
             );
-        let block_number = self.client.last_block_number().unwrap();
+        let block_number = self.client.best_block_number().unwrap();
         info!("block number: {:?}", block_number);
         info!("parent block number: {:?}", ctx.parent().number());
         info!(
@@ -580,7 +578,7 @@ fn build_block<DB, P, Client>(
 where
     DB: Database<Error = ProviderError> + AsRef<P>,
     P: StateRootProvider + HashedPostStateProvider + StorageRootProvider,
-    Client: DatabaseProviderFactory<Provider: BlockReader> + StateCommitmentProvider + Clone,
+    Client: DatabaseProviderFactory<Provider: BlockReader> + StateCommitmentProvider + Clone + BlockHashReader + BlockNumReader + HeaderProvider,
 {
     // TODO: We must run this only once per block, but we are running it on every flashblock
     // merge all transitions into bundle state, this would apply the withdrawal balance changes
@@ -635,7 +633,15 @@ where
     // };
     info!("start calculating MPT state root");
 
-    let consistent_db_view = ConsistentDbView::new_with_latest_tip(client.clone())?;
+    let block_number = client.best_block_number().unwrap();
+    info!("block number: {:?}", block_number);
+    let block_hash = client.block_hash(block_number).unwrap();
+    info!("block hash: {:?}", block_hash);
+    let ctx_block_hash = ctx.parent().hash();
+    info!("ctx block hash: {:?}", ctx_block_hash);
+    info!("ctx block number: {:?}", ctx.parent().number());
+
+    let consistent_db_view = ConsistentDbView::new(client.clone(), client.sealed_header(block_number).unwrap().map(|h| (h.hash(), block_number)));
     let (state_root_result, metrics) = calculate_root_hash_with_sparse_trie::<_, OpReceipt>(
         consistent_db_view,
         &execution_outcome,
