@@ -617,12 +617,10 @@ where
 
     let mut block_number = client.last_block_number().unwrap();
     let ctx_block_number = ctx.parent().number();
-    info!("block number: {:?}", block_number);
-    info!("ctx block number: {:?}", ctx_block_number);
-
+    
     // add a loop until block_number is equalto ctx.parent().number()
     while block_number != ctx_block_number {
-        info!("sleeping for 10ms");
+        info!("sleeping for 10ms, block number: {:?}, ctx block number: {:?}", block_number, ctx_block_number);
         sleep(Duration::from_millis(10));
         block_number = client.last_block_number().unwrap();
     }
