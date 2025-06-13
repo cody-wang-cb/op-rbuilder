@@ -203,17 +203,6 @@ where
                 ctx.parent().hash(),
                 ctx.parent().state_root,
             );
-        let block_number = self.client.best_block_number().unwrap();
-        info!("block number: {:?}", block_number);
-        info!("parent block number: {:?}", ctx.parent().number());
-        info!(
-            "parent hash from the client: {:?}",
-            self.client.block_hash(block_number).unwrap()
-        );
-        info!(
-            "created new sparse trie shared cache with parent block hash: {:?}",
-            ctx.parent().hash()
-        );
         let mut sparse_trie_local_cache = SparseTrieLocalCache::default();
 
         // 1. execute the pre steps and seal an early block with that
@@ -633,15 +622,18 @@ where
     // };
     info!("start calculating MPT state root");
 
-    let block_number = client.best_block_number().unwrap();
+    let block_number = client.last_block_number().unwrap();
+    let best_block_number = client.best_block_number().unwrap();
     info!("block number: {:?}", block_number);
+    info!("best block number: {:?}", best_block_number);
     let block_hash = client.block_hash(block_number).unwrap();
     info!("block hash: {:?}", block_hash);
     let ctx_block_hash = ctx.parent().hash();
     info!("ctx block hash: {:?}", ctx_block_hash);
-    info!("ctx block number: {:?}", ctx.parent().number());
+    info!("block number: {:?}", ctx.parent().number());
 
-    let consistent_db_view = ConsistentDbView::new(client.clone(), client.sealed_header(block_number).unwrap().map(|h| (h.hash(), block_number)));
+    // let consistent_db_view = ConsistentDbView::new_with_latest_tip(client.clone())?;
+    let consistent_db_view = ConsistentDbView::new(client.clone(), client.sealed_header(best_block_number).unwrap().map(|h| (h.hash(), best_block_number)));
     let (state_root_result, metrics) = calculate_root_hash_with_sparse_trie::<_, OpReceipt>(
         consistent_db_view,
         &execution_outcome,
