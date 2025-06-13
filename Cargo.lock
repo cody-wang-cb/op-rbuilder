@@ -3040,7 +3040,7 @@ dependencies = [
 [[package]]
 name = "eth-sparse-mpt"
 version = "0.1.0"
-source = "git+https://github.com/cody-wang-cb/rbuilder.git?rev=688164af18da7d557768b7bb3ecf8807efcd7829#688164af18da7d557768b7bb3ecf8807efcd7829"
+source = "git+https://github.com/cody-wang-cb/rbuilder.git?rev=03c3bb1a4ce9883b53de85c8a311fe5b96b01e54#03c3bb1a4ce9883b53de85c8a311fe5b96b01e54"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",

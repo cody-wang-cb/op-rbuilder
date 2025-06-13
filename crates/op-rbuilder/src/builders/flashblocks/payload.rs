@@ -1,5 +1,5 @@
 use core::time::Duration;
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, thread::sleep, time::Instant};
 
 use super::{config::FlashblocksConfig, wspub::WebSocketPublisher};
 use crate::{
@@ -31,7 +31,9 @@ use reth_optimism_node::{OpBuiltPayload, OpPayloadBuilderAttributes};
 use reth_optimism_primitives::{OpPrimitives, OpReceipt, OpTransactionSigned};
 use reth_payload_util::BestPayloadTransactions;
 use reth_provider::{
-    providers::ConsistentDbView, BlockNumReader, BlockReader, DatabaseProviderFactory, ExecutionOutcome, HashedPostStateProvider, HeaderProvider, ProviderError, StateCommitmentProvider, StateRootProvider, StorageRootProvider
+    providers::ConsistentDbView, BlockNumReader, BlockReader, DatabaseProviderFactory,
+    ExecutionOutcome, HashedPostStateProvider, HeaderProvider, ProviderError,
+    StateCommitmentProvider, StateRootProvider, StorageRootProvider,
 };
 use reth_provider::{BlockHashReader, StateProvider};
 use reth_revm::{
@@ -567,7 +569,12 @@ fn build_block<DB, P, Client>(
 where
     DB: Database<Error = ProviderError> + AsRef<P>,
     P: StateRootProvider + HashedPostStateProvider + StorageRootProvider,
-    Client: DatabaseProviderFactory<Provider: BlockReader> + StateCommitmentProvider + Clone + BlockHashReader + BlockNumReader + HeaderProvider,
+    Client: DatabaseProviderFactory<Provider: BlockReader>
+        + StateCommitmentProvider
+        + Clone
+        + BlockHashReader
+        + BlockNumReader
+        + HeaderProvider,
 {
     // TODO: We must run this only once per block, but we are running it on every flashblock
     // merge all transitions into bundle state, this would apply the withdrawal balance changes
@@ -605,35 +612,25 @@ where
 
     // // calculate the state root
     let state_root_start_time = Instant::now();
-    // let state_provider = state.database.as_ref();
-    // let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
-    // let (state_root, _trie_output) = {
-    //     state
-    //         .database
-    //         .as_ref()
-    //         .state_root_with_updates(hashed_state.clone())
-    //         .inspect_err(|err| {
-    //             warn!(target: "payload_builder",
-    //             parent_header=%ctx.parent().hash(),
-    //                 %err,
-    //                 "failed to calculate state root for payload"
-    //             );
-    //         })?
-    // };
     info!("start calculating MPT state root");
 
-    let block_number = client.last_block_number().unwrap();
-    let best_block_number = client.best_block_number().unwrap();
+    let mut block_number = client.last_block_number().unwrap();
+    let ctx_block_number = ctx.parent().number();
     info!("block number: {:?}", block_number);
-    info!("best block number: {:?}", best_block_number);
-    let block_hash = client.block_hash(block_number).unwrap();
-    info!("block hash: {:?}", block_hash);
-    let ctx_block_hash = ctx.parent().hash();
-    info!("ctx block hash: {:?}", ctx_block_hash);
-    info!("block number: {:?}", ctx.parent().number());
+    info!("ctx block number: {:?}", ctx_block_number);
 
-    // let consistent_db_view = ConsistentDbView::new_with_latest_tip(client.clone())?;
-    let consistent_db_view = ConsistentDbView::new(client.clone(), client.sealed_header(best_block_number).unwrap().map(|h| (h.hash(), best_block_number)));
+    // add a loop until block_number is equalto ctx.parent().number()
+    while block_number != ctx_block_number {
+        info!("sleeping for 10ms");
+        sleep(Duration::from_millis(10));
+        block_number = client.last_block_number().unwrap();
+    }
+
+    let sealed_header = client.sealed_header(block_number).unwrap();
+    let consistent_db_view = ConsistentDbView::new(
+        client.clone(),
+        sealed_header.map(|h| (h.hash(), block_number)),
+    );
     let (state_root_result, metrics) = calculate_root_hash_with_sparse_trie::<_, OpReceipt>(
         consistent_db_view,
         &execution_outcome,
