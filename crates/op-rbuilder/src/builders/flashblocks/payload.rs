@@ -572,25 +572,25 @@ where
         .expect("Number is in range");
 
     // // calculate the state root
-    let state_root_start_time = Instant::now();
-    let state_provider = state.database.as_ref();
-    let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
-    let (state_root, _trie_output) = {
-        state
-            .database
-            .as_ref()
-            .state_root_with_updates(hashed_state.clone())
-            .inspect_err(|err| {
-                warn!(target: "payload_builder",
-                parent_header=%ctx.parent().hash(),
-                    %err,
-                    "failed to calculate state root for payload"
-                );
-            })?
-    };
-    ctx.metrics
-        .state_root_calculation_duration
-        .record(state_root_start_time.elapsed());
+    // let state_root_start_time = Instant::now();
+    // let state_provider = state.database.as_ref();
+    // let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
+    // let (state_root, _trie_output) = {
+    //     state
+    //         .database
+    //         .as_ref()
+    //         .state_root_with_updates(hashed_state.clone())
+    //         .inspect_err(|err| {
+    //             warn!(target: "payload_builder",
+    //             parent_header=%ctx.parent().hash(),
+    //                 %err,
+    //                 "failed to calculate state root for payload"
+    //             );
+    //         })?
+    // };
+    // ctx.metrics
+    //     .state_root_calculation_duration
+    //     .record(state_root_start_time.elapsed());
 
     let mut requests_hash = None;
     let withdrawals_root = if ctx
@@ -628,7 +628,7 @@ where
         parent_hash: ctx.parent().hash(),
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
         beneficiary: ctx.evm_env.block_env.beneficiary,
-        state_root,
+        state_root: B256::ZERO,
         transactions_root,
         receipts_root,
         withdrawals_root,
@@ -711,7 +711,7 @@ where
             base_fee_per_gas: ctx.base_fee().try_into().unwrap(),
         }),
         diff: ExecutionPayloadFlashblockDeltaV1 {
-            state_root,
+            state_root: B256::ZERO,
             receipts_root,
             logs_bloom,
             gas_used: info.cumulative_gas_used,
