@@ -1,11 +1,10 @@
 use core::time::Duration;
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, thread::sleep, time::Instant};
 
 use super::{config::FlashblocksConfig, wspub::WebSocketPublisher};
 use crate::{
     builders::{
         context::{estimate_gas_for_builder_tx, OpPayloadBuilderCtx},
-        flashblocks::config::FlashBlocksConfigExt,
         generator::{BlockCell, BuildArguments},
         BuilderConfig,
     },
@@ -13,11 +12,13 @@ use crate::{
     primitives::reth::ExecutionInfo,
     traits::{ClientBounds, PoolBounds},
 };
+use alloy_consensus::BlockHeader;
 use alloy_consensus::{
     constants::EMPTY_WITHDRAWALS, proofs, BlockBody, Header, EMPTY_OMMER_ROOT_HASH,
 };
 use alloy_eips::{eip7685::EMPTY_REQUESTS_HASH, merge::BEACON_NONCE, Encodable2718};
 use alloy_primitives::{map::foldhash::HashMap, Address, B256, U256};
+use eth_sparse_mpt::*;
 use reth::payload::PayloadBuilderAttributes;
 use reth_basic_payload_builder::BuildOutcome;
 use reth_evm::{execute::BlockBuilder, ConfigureEvm};
@@ -29,9 +30,11 @@ use reth_optimism_node::{OpBuiltPayload, OpPayloadBuilderAttributes};
 use reth_optimism_primitives::{OpPrimitives, OpReceipt, OpTransactionSigned};
 use reth_payload_util::BestPayloadTransactions;
 use reth_provider::{
-    ExecutionOutcome, HashedPostStateProvider, ProviderError, StateRootProvider,
-    StorageRootProvider,
+    providers::ConsistentDbView, BlockNumReader, BlockReader, DatabaseProviderFactory,
+    ExecutionOutcome, HashedPostStateProvider, HeaderProvider, ProviderError,
+    StateCommitmentProvider, StateRootProvider, StorageRootProvider,
 };
+use reth_provider::{BlockHashReader, StateProvider};
 use reth_revm::{
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, BundleState},
@@ -43,7 +46,7 @@ use rollup_boost::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, error, metadata::Level, span, warn};
+use tracing::{debug, error, info, metadata::Level, span, warn};
 
 #[derive(Debug, Default)]
 struct ExtraExecutionInfo {
@@ -120,7 +123,10 @@ where
 impl<Pool, Client> OpPayloadBuilder<Pool, Client>
 where
     Pool: PoolBounds,
-    Client: ClientBounds,
+    Client: ClientBounds
+        + DatabaseProviderFactory<Provider: BlockReader>
+        + StateCommitmentProvider
+        + Clone,
 {
     /// Constructs an Optimism payload from the transactions sent via the
     /// Payload attributes by the sequencer. If the `no_tx_pool` argument is passed in
@@ -193,10 +199,16 @@ where
 
         let state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
         let state = StateProviderDatabase::new(&state_provider);
+        let sparse_trie_shared_cache: SparseTrieSharedCache =
+            SparseTrieSharedCache::new_with_parent_block_data(
+                ctx.parent().hash(),
+                ctx.parent().state_root,
+            );
+        let mut sparse_trie_local_cache = SparseTrieLocalCache::default();
 
         // 1. execute the pre steps and seal an early block with that
         let sequencer_tx_start_time = Instant::now();
-        let mut db = State::builder()
+        let mut db: State<StateProviderDatabase<&Box<dyn StateProvider>>> = State::builder()
             .with_database(state)
             .with_bundle_update()
             .build();
@@ -216,7 +228,14 @@ where
             .sequencer_tx_duration
             .record(sequencer_tx_start_time.elapsed());
 
-        let (payload, fb_payload, mut bundle_state) = build_block(db, &ctx, &mut info)?;
+        let (payload, fb_payload, mut bundle_state) = build_block(
+            db,
+            self.client.clone(),
+            &ctx,
+            &mut info,
+            &sparse_trie_shared_cache,
+            &mut sparse_trie_local_cache,
+        )?;
 
         best_payload.set(payload.clone());
         self.ws_pub
@@ -246,12 +265,12 @@ where
             // return early since we don't need to build a block with transactions from the pool
             return Ok(());
         }
-        let gas_per_batch = ctx.block_gas_limit() / self.config.flashblocks_per_block();
+        let gas_per_batch = ctx.block_gas_limit() / self.config.specific.flashblocks_per_block;
         let mut total_gas_per_batch = gas_per_batch;
         let da_per_batch = ctx
             .da_config
             .max_da_block_size()
-            .map(|da_limit| da_limit / self.config.flashblocks_per_block());
+            .map(|da_limit| da_limit / self.config.specific.flashblocks_per_block);
         // Check that builder tx won't affect fb limit too much
         if let Some(da_limit) = da_per_batch {
             // We error if we can't insert any tx aside from builder tx in flashblock
@@ -261,14 +280,14 @@ where
         }
         let mut total_da_per_batch = da_per_batch;
 
-        let last_flashblock = self.config.flashblocks_per_block().saturating_sub(1);
+        let last_flashblock = self.config.specific.flashblocks_per_block.saturating_sub(1);
         let mut flashblock_count = 0;
         // Create a channel to coordinate flashblock building
         let (build_tx, mut build_rx) = mpsc::channel(1);
 
         // Spawn the timer task that signals when to build a new flashblock
         let cancel_clone = ctx.cancel.clone();
-        let interval = self.config.specific.interval;
+        let interval = self.config.specific.build_interval;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
             loop {
@@ -282,12 +301,16 @@ where
                         }
                     }
                 _ = interval.tick() => {
-                            if let Err(err) = build_tx.send(()).await {
-                                error!(target: "payload_builder", "Error sending build signal: {}", err);
-                                break;
-                            }
+                    if let Err(err) = build_tx.send(()).await {
+                        if build_tx.is_closed() || cancel_clone.is_cancelled() {
+                            debug!(target: "payload_builder", "Building is stopped");
+                            break;
                         }
-                }
+
+                        error!(target: "payload_builder", "Error sending build signal: {}", err);
+                        break;
+                    }
+                }}
             }
         });
 
@@ -319,6 +342,19 @@ where
                         return None;
                     }
 
+                    // If we've built all the flashblocks, no more work to do
+                    if flashblock_count >= self.config.specific.flashblocks_per_block {
+                        tracing::info!(
+                            target: "payload_builder",
+                            target = self.config.specific.flashblocks_per_block,
+                            flashblock_count = flashblock_count,
+                            block_number = ctx.block_number(),
+                            "Built all flashblocks, stopping payload builder",
+                        );
+
+                        return None;
+                    }
+
                     // Wait for next message
                     build_rx.recv().await
                 })
@@ -327,17 +363,6 @@ where
             // Exit loop if channel closed or cancelled
             match received {
                 Some(()) => {
-                    if flashblock_count >= self.config.flashblocks_per_block() {
-                        tracing::info!(
-                            target: "payload_builder",
-                            target = self.config.flashblocks_per_block(),
-                            flashblock_count = flashblock_count,
-                            block_number = ctx.block_number(),
-                            "Skipping flashblock reached target",
-                        );
-                        continue;
-                    }
-
                     // Continue with flashblock building
                     tracing::info!(
                         target: "payload_builder",
@@ -349,6 +374,7 @@ where
                         da_used = info.cumulative_da_bytes_used,
                         "Building flashblock",
                     );
+
                     let flashblock_build_start_time = Instant::now();
                     let state = StateProviderDatabase::new(&state_provider);
                     invoke_on_first_flashblock(flashblock_count, || {
@@ -395,7 +421,7 @@ where
                     if ctx.cancel.is_cancelled() {
                         tracing::info!(
                             target: "payload_builder",
-                            "Job cancelled, stopping payload building",
+                            "Job cancelled, stopping payload building block_number={}", ctx.block_number()
                         );
                         // if the job was cancelled, stop
                         return Ok(());
@@ -412,7 +438,14 @@ where
                     });
 
                     let total_block_built_duration = Instant::now();
-                    let build_result = build_block(db, &ctx, &mut info);
+                    let build_result = build_block(
+                        db,
+                        self.client.clone(),
+                        &ctx,
+                        &mut info,
+                        &sparse_trie_shared_cache,
+                        &mut sparse_trie_local_cache,
+                    );
                     ctx.metrics
                         .total_block_built_duration
                         .record(total_block_built_duration.elapsed());
@@ -468,16 +501,11 @@ where
                     }
                 }
                 None => {
-                    // Exit loop if channel closed or cancelled
                     self.metrics.block_built_success.increment(1);
                     self.metrics
                         .flashblock_count
                         .record(flashblock_count as f64);
-                    debug!(
-                        target: "payload_builder",
-                        message = "Payload building complete, channel closed or job cancelled"
-                    );
-                    span.record("flashblock_count", flashblock_count);
+                    tracing::info!(target: "payload_builder", "Completed block building block={} flashblock_count={}", ctx.block_number(), flashblock_count);
                     return Ok(());
                 }
             }
@@ -488,7 +516,10 @@ where
 impl<Pool, Client> crate::builders::generator::PayloadBuilder for OpPayloadBuilder<Pool, Client>
 where
     Pool: PoolBounds,
-    Client: ClientBounds,
+    Client: ClientBounds
+        + DatabaseProviderFactory<Provider: BlockReader>
+        + StateCommitmentProvider
+        + Clone,
 {
     type Attributes = OpPayloadBuilderAttributes<OpTransactionSigned>;
     type BuiltPayload = OpBuiltPayload;
@@ -528,14 +559,23 @@ where
     Ok(info)
 }
 
-fn build_block<DB, P>(
+fn build_block<DB, P, Client>(
     mut state: State<DB>,
+    client: Client,
     ctx: &OpPayloadBuilderCtx,
     info: &mut ExecutionInfo<ExtraExecutionInfo>,
+    sparse_trie_shared_cache: &SparseTrieSharedCache,
+    sparse_trie_local_cache: &mut SparseTrieLocalCache,
 ) -> Result<(OpBuiltPayload, FlashblocksPayloadV1, BundleState), PayloadBuilderError>
 where
     DB: Database<Error = ProviderError> + AsRef<P>,
     P: StateRootProvider + HashedPostStateProvider + StorageRootProvider,
+    Client: DatabaseProviderFactory<Provider: BlockReader>
+        + StateCommitmentProvider
+        + Clone
+        + BlockHashReader
+        + BlockNumReader
+        + HeaderProvider,
 {
     // TODO: We must run this only once per block, but we are running it on every flashblock
     // merge all transitions into bundle state, this would apply the withdrawal balance changes
@@ -573,24 +613,50 @@ where
 
     // // calculate the state root
     let state_root_start_time = Instant::now();
-    let state_provider = state.database.as_ref();
-    let hashed_state = state_provider.hashed_post_state(execution_outcome.state());
-    let (state_root, _trie_output) = {
-        state
-            .database
-            .as_ref()
-            .state_root_with_updates(hashed_state.clone())
-            .inspect_err(|err| {
-                warn!(target: "payload_builder",
-                parent_header=%ctx.parent().hash(),
-                    %err,
-                    "failed to calculate state root for payload"
-                );
-            })?
+    info!("start calculating MPT state root");
+
+    let mut block_number = client.last_block_number().unwrap();
+    let ctx_block_number = ctx.parent().number();
+    
+    // add a loop until block_number is equalto ctx.parent().number()
+    while block_number != ctx_block_number {
+        info!("sleeping for 10ms, block number: {:?}, ctx block number: {:?}", block_number, ctx_block_number);
+        sleep(Duration::from_millis(10));
+        block_number = client.last_block_number().unwrap();
+    }
+
+    let sealed_header = client.sealed_header(block_number).unwrap();
+    let consistent_db_view = ConsistentDbView::new(
+        client.clone(),
+        sealed_header.map(|h| (h.hash(), block_number)),
+    );
+    let (state_root_result, metrics) = calculate_root_hash_with_sparse_trie::<_, OpReceipt>(
+        consistent_db_view,
+        &execution_outcome,
+        sparse_trie_shared_cache,
+        sparse_trie_local_cache,
+        &None,
+        ETHSpareMPTVersion::V2,
+    );
+
+    let state_root = match state_root_result {
+        Ok(root) => {
+            info!("Successfully calculated state root: {:?}", root);
+            root
+        }
+        Err(err) => {
+            error!("Failed to calculate state root: {:?}", err);
+            return Err(PayloadBuilderError::other(err));
+        }
     };
+
     ctx.metrics
         .state_root_calculation_duration
         .record(state_root_start_time.elapsed());
+
+    ctx.metrics
+        .fetched_nodes
+        .record(metrics.fetched_nodes as f64);
 
     let mut requests_hash = None;
     let withdrawals_root = if ctx

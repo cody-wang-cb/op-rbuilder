@@ -20,14 +20,12 @@ async fn chain_produces_blocks() -> eyre::Result<()> {
             enabled: true,
             flashblocks_port: 1239,
             flashblocks_addr: "127.0.0.1".into(),
-            flashblocks_block_time: 200,
+            flashblocks_per_block: 10,
+            flashblocks_block_overhead: 10,
         },
         ..Default::default()
     })
     .await?;
-
-    let driver = rbuilder.driver().await?;
-    driver.fund_default_accounts().await?;
 
     // Create a struct to hold received messages
     let received_messages = Arc::new(Mutex::new(Vec::new()));

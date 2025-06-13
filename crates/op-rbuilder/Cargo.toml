@@ -116,6 +116,7 @@ moka = "0.12"
 http = "1.0"
 
 rollup-boost = { git = "http://github.com/flashbots/rollup-boost", branch = "main" }
+eth-sparse-mpt = { git = "https://github.com/cody-wang-cb/rbuilder.git", rev="d2ae3dd42cd4a18cfd52996c7286adf8880f1ce8" }
 
 dashmap = { version = "6.1", optional = true }
 nanoid = { version = "0.4", optional = true }
