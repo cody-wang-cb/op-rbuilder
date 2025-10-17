@@ -1,6 +1,6 @@
 use alloy_primitives::Address;
 
-use crate::{args::OpRbuilderArgs, builders::BuilderConfig};
+use crate::{args::OpRbuilderArgs, builders::BuilderConfig, tx_bundling::TxBundlingConfig};
 use core::{
     net::{Ipv4Addr, SocketAddr},
     time::Duration,
@@ -38,6 +38,9 @@ pub struct FlashblocksConfig {
     ///
     /// If set a builder tx will be added to the start of every flashblock instead of the regular builder tx.
     pub flashblocks_number_contract_address: Option<Address>,
+
+    /// Transaction bundling configuration
+    pub tx_bundling: TxBundlingConfig,
 }
 
 impl Default for FlashblocksConfig {
@@ -49,6 +52,7 @@ impl Default for FlashblocksConfig {
             fixed: false,
             calculate_state_root: true,
             flashblocks_number_contract_address: None,
+            tx_bundling: TxBundlingConfig::default(),
         }
     }
 }
@@ -73,6 +77,14 @@ impl TryFrom<OpRbuilderArgs> for FlashblocksConfig {
         let flashblocks_number_contract_address =
             args.flashblocks.flashblocks_number_contract_address;
 
+        let tx_bundling = TxBundlingConfig {
+            enabled: args.tx_bundling.tx_bundling_enabled,
+            ws_url: args.tx_bundling.ws_url.unwrap_or_default(),
+            max_cache_size: Some(args.tx_bundling.max_cache_size),
+            reconnect_delay: Duration::from_secs(args.tx_bundling.reconnect_delay_secs),
+            ping_interval_ms: args.tx_bundling.ping_interval_ms,
+        };
+
         Ok(Self {
             ws_addr,
             interval,
@@ -80,6 +92,7 @@ impl TryFrom<OpRbuilderArgs> for FlashblocksConfig {
             fixed,
             calculate_state_root,
             flashblocks_number_contract_address,
+            tx_bundling,
         })
     }
 }

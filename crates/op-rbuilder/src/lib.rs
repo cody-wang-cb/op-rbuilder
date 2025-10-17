@@ -9,6 +9,7 @@ pub mod primitives;
 pub mod revert_protection;
 pub mod traits;
 pub mod tx;
+pub mod tx_bundling;
 pub mod tx_signer;
 
 #[cfg(test)]

@@ -33,7 +33,8 @@ use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction};
 use revm::{DatabaseCommit, context::result::ResultAndState, interpreter::as_u64_saturated};
 use std::{sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
+use alloy_eips::eip2718::Decodable2718;
 
 use crate::{
     gas_limiter::AddressGasLimiter,
@@ -546,5 +547,225 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
             bundles_reverted = num_bundles_reverted,
         );
         Ok(None)
+    }
+
+    /// Try to execute bundled transactions for the current flashblock
+    pub fn try_execute_bundled_transactions<E: Debug + Default>(
+        &self,
+        info: &mut ExecutionInfo<E>,
+        db: &mut State<impl Database>,
+        tx_bundle_store: &crate::tx_bundling::TxBundleStore,
+        remaining_gas: u64,
+        remaining_da: Option<u64>,
+    ) -> Result<(usize, usize), PayloadBuilderError> {
+        
+        
+        let start_time = Instant::now();
+        
+        // Get transaction hashes executed in this flashblock iteration
+        let current_flashblock_tx_hashes: Vec<_> = info.executed_transactions
+            .iter()
+            .map(|tx| tx.tx_hash())
+            .collect();
+        
+        // Track available resources
+        let mut gas_left = remaining_gas.saturating_sub(info.cumulative_gas_used);
+        let mut da_left = remaining_da.map(|da| da.saturating_sub(info.cumulative_da_bytes_used));
+        
+        let mut bundled_success_count = 0;
+        let mut bundled_failure_count = 0;
+        
+        // Create EVM once for all bundled txs
+        let mut evm = self.evm_config.evm_with_env(&mut *db, self.evm_env.clone());
+        
+        // Check each transaction for bundled data
+        for tx_hash in current_flashblock_tx_hashes {
+            // Check if there's bundled transaction data for this tx
+            if let Some(bundled_tx_data) = tx_bundle_store.get(&tx_hash) {
+                self.metrics.bundled_tx_attempts_total.increment(1);
+                
+                debug!(
+                    target: "payload_builder",
+                    tx_hash = ?tx_hash,
+                    bundled_tx_size = bundled_tx_data.len(),
+                    "Found bundled transaction data"
+                );
+                
+                // Decode transaction
+                let tx = match OpTransactionSigned::decode_2718(&mut bundled_tx_data.as_ref()) {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        warn!(
+                            target: "payload_builder",
+                            tx_hash = ?tx_hash,
+                            error = %e,
+                            "Failed to decode bundled transaction"
+                        );
+                        bundled_failure_count += 1;
+                        self.metrics.bundled_tx_failures_total.increment(1);
+                        continue;
+                    }
+                };
+                
+                // Recover signer from signature
+                let recovered_tx = match tx.try_clone_into_recovered() {
+                    Ok(tx) => tx,
+                    Err(_) => {
+                        warn!(
+                            target: "payload_builder",
+                            tx_hash = ?tx_hash,
+                            "Failed to recover signer for bundled transaction"
+                        );
+                        bundled_failure_count += 1;
+                        self.metrics.bundled_tx_failures_total.increment(1);
+                        continue;
+                    }
+                };
+                
+                // DA size is the encoded transaction size (for L1 data availability)
+                let tx_da_size = bundled_tx_data.len() as u64;
+                
+                // Pre-check gas limit
+                if recovered_tx.gas_limit() > gas_left {
+                    warn!(
+                        target: "payload_builder",
+                        tx_hash = ?tx_hash,
+                        tx_gas_limit = recovered_tx.gas_limit(),
+                        gas_left = gas_left,
+                        "Bundled tx gas limit exceeds remaining"
+                    );
+                    bundled_failure_count += 1;
+                    self.metrics.bundled_tx_failures_total.increment(1);
+                    continue;
+                }
+                
+                // Pre-check DA limit
+                if let Some(da) = da_left {
+                    if tx_da_size > da {
+                        warn!(
+                            target: "payload_builder",
+                            tx_hash = ?tx_hash,
+                            tx_da_size = tx_da_size,
+                            da_left = da,
+                            "Bundled tx DA size exceeds remaining"
+                        );
+                        bundled_failure_count += 1;
+                        self.metrics.bundled_tx_failures_total.increment(1);
+                        continue;
+                    }
+                }
+                
+                // Execute the bundled transaction
+                let ResultAndState { result, state } = match evm.transact(&recovered_tx) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        warn!(
+                            target: "payload_builder",
+                            tx_hash = ?tx_hash,
+                            error = %e,
+                            "Failed to execute bundled transaction"
+                        );
+                        bundled_failure_count += 1;
+                        self.metrics.bundled_tx_failures_total.increment(1);
+                        continue;
+                    }
+                };
+                
+                // Check if successful
+                if !result.is_success() {
+                    // Extract revert output data
+                    let revert_output = result.output()
+                        .map(|bytes| {
+                            if bytes.is_empty() {
+                                "empty".to_string()
+                            } else {
+                                // Show hex for analysis
+                                format!("0x{}", alloy_primitives::hex::encode(bytes))
+                            }
+                        })
+                        .unwrap_or_else(|| "none".to_string());
+                    
+                    warn!(
+                        target: "payload_builder",
+                        tx_hash = ?tx_hash,
+                        to = ?recovered_tx.to(),
+                        value = ?recovered_tx.value(),
+                        gas_used = result.gas_used(),
+                        gas_limit = recovered_tx.gas_limit(),
+                        revert_output = %revert_output,
+                        "Bundled transaction reverted"
+                    );
+                    bundled_failure_count += 1;
+                    self.metrics.bundled_tx_failures_total.increment(1);
+                    continue;
+                }
+                
+                let gas_used = result.gas_used();
+                
+                // Update cumulative metrics
+                info.cumulative_gas_used += gas_used;
+                info.cumulative_da_bytes_used += tx_da_size;
+                
+                // Build and add receipt
+                let receipt_ctx = ReceiptBuilderCtx {
+                    tx: recovered_tx.inner(),
+                    evm: &evm,
+                    result,
+                    state: &state,
+                    cumulative_gas_used: info.cumulative_gas_used,
+                };
+                info.receipts.push(self.build_receipt(receipt_ctx, None));
+                
+                // Commit state changes
+                evm.db_mut().commit(state);
+                
+                // Update fees
+                let base_fee = self.base_fee();
+                let miner_fee = recovered_tx
+                    .effective_tip_per_gas(base_fee)
+                    .expect("fee is always valid; execution succeeded");
+                info.total_fees += U256::from(miner_fee) * U256::from(gas_used);
+                
+                // Append to execution lists
+                info.executed_senders.push(recovered_tx.signer());
+                info.executed_transactions.push(recovered_tx.into_inner());
+                
+                // Update remaining resources
+                gas_left = gas_left.saturating_sub(gas_used);
+                if let Some(da) = da_left.as_mut() {
+                    *da = da.saturating_sub(tx_da_size);
+                }
+                
+                bundled_success_count += 1;
+                self.metrics.bundled_tx_success_total.increment(1);
+                self.metrics.bundled_tx_gas_used.record(gas_used as f64);
+                
+                info!(
+                    target: "payload_builder",
+                    tx_hash = ?tx_hash,
+                    gas_used = gas_used,
+                    da_size = tx_da_size,
+                    "Successfully included bundled transaction"
+                );
+            }
+        }
+        
+        // Release DB reference
+        drop(evm);
+        
+        let bundled_execution_time = start_time.elapsed();
+        self.metrics.bundled_tx_execution_duration.record(bundled_execution_time);
+        
+        if bundled_success_count > 0 || bundled_failure_count > 0 {
+            info!(
+                target: "payload_builder",
+                successes = bundled_success_count,
+                failures = bundled_failure_count,
+                duration_ms = bundled_execution_time.as_millis(),
+                "Completed bundled transaction processing"
+            );
+        }
+        
+        Ok((bundled_success_count, bundled_failure_count))
     }
 }

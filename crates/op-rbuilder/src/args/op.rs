@@ -61,6 +61,8 @@ pub struct OpRbuilderArgs {
     #[command(flatten)]
     pub flashblocks: FlashblocksArgs,
     #[command(flatten)]
+    pub tx_bundling: TxBundlingArgs,
+    #[command(flatten)]
     pub telemetry: TelemetryArgs,
     #[command(flatten)]
     pub flashtestations: FlashtestationsArgs,
@@ -175,6 +177,61 @@ impl Default for FlashblocksArgs {
             unreachable!()
         };
         node_command.ext.flashblocks
+    }
+}
+
+/// Parameters for transaction bundling configuration
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct TxBundlingArgs {
+    /// Enable transaction bundling via WebSocket
+    #[arg(
+        long = "tx-bundling.enabled",
+        default_value = "false",
+        env = "TX_BUNDLING_ENABLED"
+    )]
+    pub tx_bundling_enabled: bool,
+
+    /// WebSocket URL to connect to for bundled transaction data
+    #[arg(
+        long = "tx-bundling.ws-url",
+        env = "TX_BUNDLING_WS_URL"
+    )]
+    pub ws_url: Option<String>,
+
+    /// Maximum number of entries to store in the bundle cache
+    #[arg(
+        long = "tx-bundling.max-cache-size",
+        default_value = "10000",
+        env = "TX_BUNDLING_MAX_CACHE_SIZE"
+    )]
+    pub max_cache_size: usize,
+
+    /// Reconnection delay in seconds when WebSocket disconnects
+    #[arg(
+        long = "tx-bundling.reconnect-delay-secs",
+        default_value = "5",
+        env = "TX_BUNDLING_RECONNECT_DELAY_SECS"
+    )]
+    pub reconnect_delay_secs: u64,
+
+    /// Ping interval in milliseconds to keep WebSocket connection alive
+    #[arg(
+        long = "tx-bundling.ping-interval-ms",
+        default_value = "30000",
+        env = "TX_BUNDLING_PING_INTERVAL_MS"
+    )]
+    pub ping_interval_ms: u64,
+}
+
+impl Default for TxBundlingArgs {
+    fn default() -> Self {
+        Self {
+            tx_bundling_enabled: false,
+            ws_url: None,
+            max_cache_size: 10000,
+            reconnect_delay_secs: 5,
+            ping_interval_ms: 30000,
+        }
     }
 }
 

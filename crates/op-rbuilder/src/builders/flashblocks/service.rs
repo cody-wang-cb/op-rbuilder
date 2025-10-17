@@ -11,6 +11,7 @@ use crate::{
     },
     flashtestations::service::bootstrap_flashtestations,
     traits::{NodeBounds, PoolBounds},
+    tx_bundling::{TxBundleStore, spawn_bundle_listener},
 };
 use reth_basic_payload_builder::BasicPayloadJobGeneratorConfig;
 use reth_node_api::NodeTypes;
@@ -36,6 +37,11 @@ impl FlashblocksServiceBuilder {
     {
         let once_lock = Arc::new(std::sync::OnceLock::new());
 
+        // Initialize transaction bundling store
+        let tx_bundle_store = Arc::new(TxBundleStore::new(
+            self.0.specific.tx_bundling.max_cache_size,
+        ));
+
         let payload_builder = OpPayloadBuilder::new(
             OpEvmConfig::optimism(ctx.chain_spec()),
             pool,
@@ -43,7 +49,43 @@ impl FlashblocksServiceBuilder {
             self.0.clone(),
             builder_tx,
             once_lock.clone(),
+            tx_bundle_store.clone(),
         )?;
+
+        // Spawn WebSocket listener if transaction bundling is enabled
+        tracing::info!(
+            enabled = self.0.specific.tx_bundling.enabled,
+            ws_url = %self.0.specific.tx_bundling.ws_url,
+            "Transaction bundling configuration"
+        );
+
+        if self.0.specific.tx_bundling.enabled {
+            if self.0.specific.tx_bundling.ws_url.is_empty() {
+                tracing::warn!("Transaction bundling enabled but no WebSocket URL provided");
+            } else {
+                let ws_url = self.0.specific.tx_bundling.ws_url.clone();
+                let reconnect_delay = self.0.specific.tx_bundling.reconnect_delay;
+                let ping_interval_ms = self.0.specific.tx_bundling.ping_interval_ms;
+                let metrics = payload_builder.metrics.clone();
+
+                tracing::info!(
+                    ws_url = %ws_url,
+                    reconnect_delay_secs = reconnect_delay.as_secs(),
+                    ping_interval_ms = ping_interval_ms,
+                    "Starting transaction bundling WebSocket listener"
+                );
+
+                spawn_bundle_listener(
+                    ws_url,
+                    tx_bundle_store,
+                    reconnect_delay,
+                    ping_interval_ms,
+                    metrics,
+                );
+            }
+        } else {
+            tracing::info!("Transaction bundling is disabled");
+        }
 
         let payload_job_config = BasicPayloadJobGeneratorConfig::default();
 

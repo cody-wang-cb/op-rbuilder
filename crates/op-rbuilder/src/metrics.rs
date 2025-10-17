@@ -151,6 +151,20 @@ pub struct OpRBuilderMetrics {
     pub bundles_reverted: Histogram,
     /// Histogram of eth_sendBundle request duration
     pub bundle_receive_duration: Histogram,
+    /// Number of bundled transaction execution attempts
+    pub bundled_tx_attempts_total: Counter,
+    /// Number of successfully included bundled transactions
+    pub bundled_tx_success_total: Counter,
+    /// Number of failed bundled transaction attempts
+    pub bundled_tx_failures_total: Counter,
+    /// Histogram of gas used by bundled transactions
+    pub bundled_tx_gas_used: Histogram,
+    /// Duration of bundled transaction execution
+    pub bundled_tx_execution_duration: Histogram,
+    /// Number of messages received from bundle listener WebSocket
+    pub bundle_listener_messages_received: Counter,
+    /// Number of bundles successfully stored by listener
+    pub bundle_listener_bundles_stored: Counter,
 }
 
 impl OpRBuilderMetrics {

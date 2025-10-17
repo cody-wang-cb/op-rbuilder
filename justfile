@@ -1,7 +1,13 @@
-# Build and run op-rbuilder in playground mode for testing
+# Build and run op-rbuilder in playground mode for testing with tx bundling
 run-playground:
   cargo build --bin op-rbuilder -p op-rbuilder
-  ./target/debug/op-rbuilder node --builder.playground
+  ./target/debug/op-rbuilder node --builder.playground --datadir ~/.playground/devnet/rbuilder \
+    --flashblocks.enabled \
+    --tx-bundling.enabled \
+    --tx-bundling.ws-url ws://localhost:8080 \
+    --tx-bundling.ping-interval-ms 30000 \
+    --tx-bundling.max-cache-size 10000 \
+    --tx-bundling.reconnect-delay-secs 5 
 
 # Run the complete test suite (genesis generation, build, and tests)
 run-tests:

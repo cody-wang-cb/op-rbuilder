@@ -11,6 +11,7 @@ use crate::{
     metrics::OpRBuilderMetrics,
     primitives::reth::ExecutionInfo,
     traits::{ClientBounds, PoolBounds},
+    tx_bundling::TxBundleStore,
 };
 use alloy_consensus::{
     BlockBody, EMPTY_OMMER_ROOT_HASH, Header, constants::EMPTY_WITHDRAWALS, proofs,
@@ -148,6 +149,8 @@ pub(super) struct OpPayloadBuilder<Pool, Client, BuilderTx> {
         Arc<OnceLock<tokio::sync::broadcast::Sender<Events<OpEngineTypes>>>>,
     /// Rate limiting based on gas. This is an optional feature.
     pub address_gas_limiter: AddressGasLimiter,
+    /// Store for bundled transaction data
+    pub tx_bundle_store: Arc<TxBundleStore>,
 }
 
 impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
@@ -161,6 +164,7 @@ impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
         payload_builder_handle: Arc<
             OnceLock<tokio::sync::broadcast::Sender<Events<OpEngineTypes>>>,
         >,
+        tx_bundle_store: Arc<TxBundleStore>,
     ) -> eyre::Result<Self> {
         let metrics = Arc::new(OpRBuilderMetrics::default());
         let ws_pub = WebSocketPublisher::new(config.specific.ws_addr, Arc::clone(&metrics))?.into();
@@ -175,6 +179,7 @@ impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
             builder_tx,
             payload_builder_handle,
             address_gas_limiter,
+            tx_bundle_store,
         })
     }
 }
@@ -648,6 +653,17 @@ where
             return Ok(());
         }
 
+        // Try to execute bundled transactions
+        if self.config.specific.tx_bundling.enabled {
+            ctx.try_execute_bundled_transactions(
+                info,
+                state,
+                &self.tx_bundle_store,
+                target_gas_for_batch.min(ctx.block_gas_limit()),
+                target_da_per_batch,
+            )?;
+        }
+
         let payload_tx_simulation_time = tx_execution_start_time.elapsed();
         ctx.metrics
             .payload_tx_simulation_duration
@@ -865,6 +881,7 @@ where
             )
         }
     }
+
 }
 
 #[async_trait::async_trait]
