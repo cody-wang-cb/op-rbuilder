@@ -625,12 +625,21 @@ where
             .set(transaction_pool_fetch_time);
 
         let tx_execution_start_time = Instant::now();
+        
+        // Execute transactions with inline bundle checking if enabled
+        let bundle_store_ref = if self.config.specific.tx_bundling.enabled {
+            Some(self.tx_bundle_store.as_ref())
+        } else {
+            None
+        };
+        
         ctx.execute_best_transactions(
             info,
             state,
             best_txs,
             target_gas_for_batch.min(ctx.block_gas_limit()),
             target_da_per_batch,
+            bundle_store_ref,
         )?;
         // Extract last transactions
         let new_transactions = info.executed_transactions[info.extra.last_flashblock_index..]
@@ -652,17 +661,9 @@ where
             );
             return Ok(());
         }
-
-        // Try to execute bundled transactions
-        if self.config.specific.tx_bundling.enabled {
-            ctx.try_execute_bundled_transactions(
-                info,
-                state,
-                &self.tx_bundle_store,
-                target_gas_for_batch.min(ctx.block_gas_limit()),
-                target_da_per_batch,
-            )?;
-        }
+        
+        // Note: Bundled transactions are now executed inline after each transaction
+        // The old batch-processing code below is removed
 
         let payload_tx_simulation_time = tx_execution_start_time.elapsed();
         ctx.metrics

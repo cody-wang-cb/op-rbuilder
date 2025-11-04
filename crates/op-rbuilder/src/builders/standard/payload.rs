@@ -394,6 +394,7 @@ impl<Txs: PayloadTxsBounds> OpBuilder<'_, Txs> {
                     &mut best_txs,
                     block_gas_limit,
                     block_da_limit,
+                    None, // Standard mode doesn't support transaction bundling
                 )?
                 .is_some()
             {
